@@ -1,44 +1,28 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-class SmilesTokenizer:
-    def __init__(self):
-        # Restricted vocabulary focused on stable organic drug-like atoms/bonds
-        chars = ['<pad>', '<sos>', '<eos>', 'C', 'c', 'O', 'N', 'n', 'F', '(', ')', '=', '1', '2']
-        self.char_to_idx = {c: i for i, c in enumerate(chars)}
-        self.idx_to_char = {i: c for c, i in self.char_to_idx.items()}
-        self.vocab_size = len(chars)
-        self.sos_idx = self.char_to_idx['<sos>']
-        self.eos_idx = self.char_to_idx['<eos>']
-        self.pad_idx = self.char_to_idx['<pad>']
+class PretrainedSMILESGenerator(nn.Module):
+    def __init__(self, model_name="msb-roshan/molgpt", device="cpu"):
+        """
+        Loads a GPT-2 style model pretrained on SMILES strings.
+        """
+        super(PretrainedSMILESGenerator, self).__init__()
+        self.device = device
+        
+        print(f"Loading Pretrained Tokenizer ({model_name})...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # GPT2 doesn't have a default PAD or BOS token, so we define them
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        if self.tokenizer.bos_token is None:
+            self.tokenizer.bos_token = self.tokenizer.eos_token
+            
+        print(f"Loading Pretrained Causal LM ({model_name})...")
+        self.model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
 
-    def encode(self, smiles):
-        return [self.sos_idx] + [self.char_to_idx.get(c, self.pad_idx) for c in smiles] + [self.eos_idx]
-
-    def decode(self, indices):
-        smiles = ""
-        for idx in indices:
-            if idx == self.eos_idx:
-                break
-            if idx not in [self.sos_idx, self.pad_idx]:
-                smiles += self.idx_to_char[idx]
-        return smiles
-
-class RNNSmilesGenerator(nn.Module):
-    def __init__(self, vocab_size, embed_size=128, hidden_size=256):
-        super(RNNSmilesGenerator, self).__init__()
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.gru = nn.GRU(embed_size, hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, vocab_size)
-
-    def forward(self, x, hidden):
-        # x shape: (batch_size, 1)
-        embedded = self.embedding(x)
-        out, hidden = self.gru(embedded, hidden)
-        logits = self.fc(out.squeeze(1))
-        return logits, hidden
-
-    def init_hidden(self, batch_size, device):
-        return torch.zeros(1, batch_size, self.hidden_size).to(device)
+    def forward(self, input_ids, past_key_values=None):
+        # We pass past_key_values to make step-by-step generation extremely fast on 4GB VRAM
+        outputs = self.model(input_ids=input_ids, past_key_values=past_key_values)
+        return outputs.logits, outputs.past_key_values

@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+env/
+
+# Model Checkpoints (Too large for GitHub)
+checkpoints/
+*.pth
+*.pt
+
+# Temporary Docking Files
+temp_ligand.sdf
+temp_ligand.pdbqt
+*.log
+
+# OS generated files
+.DS_Store
