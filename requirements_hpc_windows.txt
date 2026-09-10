@@ -1,0 +1,33 @@
+# =============================================================================
+# Python Dependencies for Windows HPC (RTX 3090 / CUDA 12.x / 64 GB RAM)
+# =============================================================================
+
+# CRITICAL NUMPY FIX: NumPy 2.x breaks SciPy / Scikit-Learn C extensions on Windows.
+# Pinning to <2.0.0 is MANDATORY to prevent import crashes in stable-baselines3.
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0,<1.13.0
+
+# Chemistry Toolkit
+rdkit>=2023.3.1
+# openbabel-wheel provides precompiled Windows Python bindings AND embeds
+# site-packages/openbabel/bin/obabel.exe (eliminates manual Windows installation!)
+openbabel-wheel>=3.1.1.20
+
+# Deep Learning Backbone (PyTorch + CUDA 12.1)
+# Run first: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Language Modeling / Policy
+transformers>=4.30.0
+tokenizers>=0.13.3
+accelerate>=0.21.0
+
+# Reinforcement Learning Environment & Algorithms
+gymnasium>=0.28.1,<0.30.0
+stable-baselines3>=2.1.0
+
+# Logging, Monitoring & Visualization
+tensorboard>=2.13.0
+pandas>=2.0.0
+tqdm>=4.65.0

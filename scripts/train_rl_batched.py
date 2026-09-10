@@ -5,6 +5,15 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import concurrent.futures
 
+# RDKit imports for fingerprinting, canonicalization, and logging suppression
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit import DataStructs
+from rdkit import RDLogger
+
+# Suppress RDKit warning floods (SMILES Parse Error, Kekulize, etc.)
+RDLogger.DisableLog('rdApp.*')
+
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
 
@@ -12,10 +21,13 @@ from models.policy_network import PretrainedSMILESGenerator
 from models.reward_oracle import RewardOracle
 
 # Top-level function for multiprocessing to avoid pickling issues
-# We instantiate the oracle inside the worker so each CPU core gets its own isolated instance
 def evaluate_worker(smiles):
-    oracle = RewardOracle()
-    return oracle.evaluate_smiles(smiles, run_docking=False)
+    # Absolute path to your actual DRD2 receptor file
+    target_path = os.path.join(project_root, "data", "raw", "drd2_clean.pdbqt")
+    raw_dir = os.path.join(project_root, "data", "raw")
+    #print(f"Files actually in directory: {os.listdir(raw_dir)}")
+    oracle = RewardOracle(receptor_pdbqt_path=target_path)
+    return oracle.evaluate_smiles(smiles, run_docking=True)
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,11 +44,11 @@ def train():
     max_length = 50
     batch_size = 16
     baseline_reward = 0.0    
-    ema_alpha = 0.1          
+    ema_alpha = 0.05          
     
-    # --- NEW: GLOBAL MEMORY BUFFER ---
-    # Tracks every valid molecule the model has ever generated
-    global_seen_smiles = set()
+    # --- UPGRADED: GLOBAL MEMORY BUFFER ---
+    # Tracks structural fingerprints of valid generated molecules
+    global_seen_fps = []
 
     for episode in range(1, num_episodes + 1):
         model.train()
@@ -48,7 +60,7 @@ def train():
         batch_sampled_indices = [[] for _ in range(batch_size)]
         is_finished = torch.zeros(batch_size, dtype=torch.bool).to(device)
 
-        # GENERATION (Unchanged)
+        # GENERATION
         with torch.amp.autocast('cuda'):
             for step in range(max_length):
                 logits, past_key_values = generator(current_token, past_key_values)
@@ -70,12 +82,18 @@ def train():
                 if is_finished.all(): break
                 current_token = action.unsqueeze(-1) 
 
-        # DECODING
+        # --- UPGRADED: DECODING EFFICIENCY ---
         generated_smiles_list = []
         for i in range(batch_size):
             raw_smiles = tokenizer.decode(batch_sampled_indices[i], skip_special_tokens=True).strip()
-            generated_smiles = raw_smiles.replace(" ", "").split(".")[0]
-            generated_smiles_list.append(generated_smiles)
+            cleaned_smiles = raw_smiles.replace(" ", "").split(".")[0]
+            
+            # Use RDKit to ensure chemical validity and canonicalize before evaluation
+            mol = Chem.MolFromSmiles(cleaned_smiles)
+            if mol is not None:
+                generated_smiles_list.append(Chem.MolToSmiles(mol))
+            else:
+                generated_smiles_list.append(cleaned_smiles)
 
         # MULTITHREADED EVALUATION
         batch_rewards = []
@@ -89,25 +107,42 @@ def train():
             if res["valid"]:
                 valid_count += 1
                 
-        # --- NEW: DIVERSITY PENALTY LOGIC ---
-        batch_seen = set()
+        # --- UPGRADED: STRUCTURAL DIVERSITY PENALTY LOGIC ---
+        batch_seen_fps = []
         
         for i, smiles in enumerate(generated_smiles_list):
             if not results[i]["valid"]:
                 continue
                 
-            # Penalty 1: The model generated the same molecule multiple times in THIS batch
-            if smiles in batch_seen:
-                batch_rewards[i] -= 2.0  
-            else:
-                batch_seen.add(smiles)
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                continue
                 
-            # Penalty 2: The model generated a molecule it already found in a PAST episode
-            if smiles in global_seen_smiles:
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+            
+            # Penalty 1: Intra-batch structural similarity
+            batch_max_sim = 0.0
+            if batch_seen_fps:
+                batch_sims = DataStructs.BulkTanimotoSimilarity(fp, batch_seen_fps)
+                batch_max_sim = max(batch_sims)
+                
+            if batch_max_sim > 0.75:
+                batch_rewards[i] -= 2.0  
+                continue 
+            else:
+                batch_seen_fps.append(fp)
+                
+            # Penalty 2: Global historical structural similarity
+            global_max_sim = 0.0
+            if global_seen_fps:
+                global_sims = DataStructs.BulkTanimotoSimilarity(fp, global_seen_fps)
+                global_max_sim = max(global_sims)
+                
+            if global_max_sim > 0.75:
                 batch_rewards[i] -= 3.0  # Massive penalty to force exploration
             else:
-                global_seen_smiles.add(smiles)
-        # ------------------------------------
+                global_seen_fps.append(fp)
+        # ----------------------------------------------------
                 
         sample_smiles = generated_smiles_list[0]
         rewards_tensor = torch.tensor(batch_rewards, dtype=torch.float32).to(device)
@@ -135,8 +170,9 @@ def train():
         scaler.step(optimizer)
         scaler.update()
 
+        # Print statement updated to track fingerprint count instead of raw strings
         print(f"Ep {episode:03d} | Mean Reward: {batch_mean_reward:+.3f} | Baseline: {baseline_reward:+.3f} | "
-              f"Valid: {valid_count}/{batch_size} | Unique Historically: {len(global_seen_smiles)} | Sample: {sample_smiles}")
+              f"Valid: {valid_count}/{batch_size} | Unique Historically: {len(global_seen_fps)} | Sample: {sample_smiles}")
 
     print("--- Training Complete ---")
     save_path = "checkpoints/smiles_generator_optimized.pth"

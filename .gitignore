@@ -10,8 +10,8 @@ checkpoints/
 *.pt
 
 # Temporary Docking Files
-temp_ligand.sdf
-temp_ligand.pdbqt
+temp_ligand*.sdf
+temp_ligand*.pdbqt
 *.log
 
 # OS generated files
