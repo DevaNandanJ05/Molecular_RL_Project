@@ -21,6 +21,7 @@ import csv
 import time
 import shutil
 import argparse
+import glob
 import multiprocessing
 import subprocess
 import numpy as np
@@ -266,6 +267,39 @@ class MolGPTExtractorHPC(BaseFeaturesExtractor):
 
         return step_hidden.float()
 
+
+# ============================================================================
+# LOGGING & CHECKPOINT CALLBACKS
+# ============================================================================
+class CleanCheckpointCallback(CheckpointCallback):
+    """
+    Saves a checkpoint every `save_freq` steps, but automatically deletes
+    older checkpoints to prevent disk space exhaustion (Errno 28).
+    """
+    def __init__(self, save_freq: int, save_path: str, name_prefix: str = "rl_model", keep_last: int = 2, **kwargs):
+        super().__init__(save_freq, save_path, name_prefix=name_prefix, **kwargs)
+        self.keep_last = keep_last
+
+    def _on_step(self) -> bool:
+        # Save the checkpoint using the parent class
+        result = super()._on_step()
+        
+        if self.n_calls % self.save_freq == 0:
+            # Find and sort checkpoints
+            pattern = os.path.join(self.save_path, f"{self.name_prefix}_*_steps.zip")
+            files = glob.glob(pattern)
+            # Sort by modification time (oldest first)
+            files.sort(key=os.path.getmtime)
+            
+            # Delete older checkpoints, keeping only the last `keep_last`
+            if len(files) > self.keep_last:
+                for f in files[:-self.keep_last]:
+                    try:
+                        os.remove(f)
+                    except OSError as e:
+                        print(f"Warning: Could not delete old checkpoint {f}: {e}")
+                        
+        return result
 
 # ============================================================================
 # LOGGING CALLBACK — Multi-Day CSV + TensorBoard Tracking
@@ -600,10 +634,11 @@ def train(
             log_dir=config["log_dir"],
             summary_freq=config["log_summary_freq"],
         ),
-        CheckpointCallback(
+        CleanCheckpointCallback(
             save_freq=max(config["checkpoint_freq"] // config["n_envs"], 1),
             save_path=config["checkpoint_dir"],
             name_prefix="ppo_molgpt_hpc",
+            keep_last=2,
             save_replay_buffer=False,
             save_vecnormalize=False,
         ),
