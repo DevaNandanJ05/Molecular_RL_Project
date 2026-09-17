@@ -3,7 +3,8 @@ import sys
 import shutil
 import subprocess
 import uuid
-from rdkit import Chem
+from collections import deque
+from rdkit import Chem, DataStructs
 from rdkit.Chem import QED, Descriptors, AllChem, rdMolDescriptors
 
 
@@ -111,7 +112,10 @@ class RewardOracle:
         vina_executable=None,
         exhaustiveness=4,
         obabel_path=None,
-        cpu=1
+        cpu=1,
+        similarity_threshold=0.75,
+        diversity_penalty=3.0,
+        recent_buffer_size=100
     ):
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         if receptor_pdbqt_path and not os.path.isabs(receptor_pdbqt_path):
@@ -124,19 +128,38 @@ class RewardOracle:
         self.exhaustiveness = exhaustiveness
         self.cpu = max(int(cpu), 1)
 
+        # Internal Tanimoto diversity tracking against recent candidates
+        self.similarity_threshold = float(similarity_threshold)
+        self.diversity_penalty = float(diversity_penalty)
+        self.recent_buffer_size = int(recent_buffer_size)
+        self.recent_candidates = deque(maxlen=self.recent_buffer_size)
+
+    def reset_diversity_buffer(self):
+        """Clears the internal recent candidates memory buffer."""
+        self.recent_candidates.clear()
+
     def evaluate_smiles(self, smiles: str, run_docking: bool = False) -> dict:
         mol = Chem.MolFromSmiles(smiles)
         
         if mol is None:
-            return {"valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0}
+            return {
+                "valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0,
+                "max_tanimoto": 0.0, "diversity_penalty": 0.0
+            }
         
         try:
             Chem.SanitizeMol(mol)
         except Exception:
-            return {"valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0}
+            return {
+                "valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0,
+                "max_tanimoto": 0.0, "diversity_penalty": 0.0
+            }
 
         if len(smiles.strip()) < 3:
-            return {"valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0}
+            return {
+                "valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0,
+                "max_tanimoto": 0.0, "diversity_penalty": 0.0
+            }
             
         qed_score = QED.qed(mol)
         mw = Descriptors.MolWt(mol)
@@ -154,13 +177,28 @@ class RewardOracle:
         if rot_bonds > 10:
             penalty += 1.0
 
+        # Internal Tanimoto Similarity Diversity Check against Recent Candidates
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+        max_sim = 0.0
+        diversity_penalty_applied = 0.0
+        if len(self.recent_candidates) > 0:
+            sims = DataStructs.BulkTanimotoSimilarity(fp, list(self.recent_candidates))
+            max_sim = float(max(sims))
+            if max_sim > self.similarity_threshold:
+                diversity_penalty_applied = self.diversity_penalty
+                penalty += diversity_penalty_applied
+
+        # Register current candidate fingerprint into recent buffer
+        self.recent_candidates.append(fp)
+
         if not run_docking or self.receptor_path is None or not os.path.exists(self.receptor_path):
             if run_docking:
                 print(f"[Oracle Warning] Receptor not found at {self.receptor_path}. Falling back to 2D.")
             total_reward = (qed_score * 3.0) - penalty
             return {
                 "valid": True, "qed": qed_score, "mw": mw, 
-                "docking_score": None, "total_reward": total_reward
+                "docking_score": None, "total_reward": total_reward,
+                "max_tanimoto": max_sim, "diversity_penalty": diversity_penalty_applied
             }
 
         # 3D Docking Evaluation
@@ -175,7 +213,8 @@ class RewardOracle:
 
         return {
             "valid": True, "qed": qed_score, "mw": mw,
-            "docking_score": docking_score, "total_reward": total_reward
+            "docking_score": docking_score, "total_reward": total_reward,
+            "max_tanimoto": max_sim, "diversity_penalty": diversity_penalty_applied
         }
 
     def _run_vina_docking(self, mol) -> float:

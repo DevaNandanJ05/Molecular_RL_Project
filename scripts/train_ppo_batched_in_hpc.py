@@ -22,6 +22,7 @@ import time
 import shutil
 import argparse
 import multiprocessing
+import subprocess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -67,22 +68,23 @@ def get_default_config() -> dict:
         "obabel_path": resolve_obabel_path(),
 
         # ---- Parallelism ----
-        "n_envs": 16,                  # 16 parallel docking workers
+        "n_envs": 32,                  # 32 parallel docking workers (fits in 64 GB RAM)
         "vec_env": "subproc",          # "subproc" (multiprocessing) or "dummy" (single process)
 
         # ---- Docking ----
-        "vina_exhaustiveness": 8,      # High-fidelity search for HPC (exhaustiveness=8)
+        "vina_exhaustiveness": 4,      # Lower for training throughput (re-dock top hits at 32+ later)
 
-        # ---- PPO Hyperparameters (Optimized for 24 GB VRAM) ----
-        "n_steps": 256,                # Steps per env before PPO update (256 × 16 = 4,096 transitions)
-        "batch_size": 128,             # PPO minibatch size
-        "n_epochs": 10,                # Gradient passes over each rollout buffer
-        "learning_rate": 3e-5,         # Peak LR (linearly decayed to 0)
+        # ---- PPO Hyperparameters (Stabilized for RTX 3060 12 GB) ----
+        "n_steps": 256,                # Steps per env before PPO update (256 × 32 = 8,192 transitions)
+        "batch_size": 512,             # PPO minibatch size (larger for better GPU utilization)
+        "n_epochs": 6,                 # Reduced to prevent high KL divergence
+        "learning_rate": 1e-5,         # Peak LR — reduced from 3e-5 to fix training instability
         "gamma": 0.99,                 # Discount factor
         "gae_lambda": 0.95,            # GAE lambda for advantage estimation
-        "ent_coef": 0.02,              # Controlled entropy bonus for exploration
-        "clip_range": 0.2,             # PPO clipping
-        "max_grad_norm": 1.0,          # Gradient clipping
+        "ent_coef": 0.04,              # Increased entropy bonus to escape trivial-molecule trap
+        "clip_range": 0.15,            # Tighter PPO clipping (was 80%+ clip fraction at 0.2)
+        "max_grad_norm": 0.5,          # More aggressive gradient clipping for unfrozen MolGPT
+        "target_kl": 0.03,             # Early-stop PPO epochs when KL exceeds threshold
         "max_length": 50,              # Max SMILES token length
 
         # ---- Training Duration ----
@@ -90,7 +92,7 @@ def get_default_config() -> dict:
 
         # ---- Model Architecture ----
         "unfreeze_molgpt": True,       # Full fine-tuning enabled by 24 GB VRAM
-        "vf_net_arch": [256, 256],     # Dedicated value network
+        "vf_net_arch": [512, 256],     # Dedicated value network
 
         # ---- Checkpointing & Logging ----
         "checkpoint_freq": 10_000,     # Save model checkpoint every N timesteps
@@ -159,7 +161,6 @@ class MolGenEnvHPC(gym.Env):
             obabel_path=obabel_path or HPC_CONFIG["obabel_path"],
             cpu=1  # One CPU core per worker to prevent Windows thread thrashing
         )
-        self.local_seen_fps = []
         self.episode_count = 0
 
         self.seq = np.full((self.max_length,), self.pad_token_id, dtype=np.int32)
@@ -200,20 +201,9 @@ class MolGenEnvHPC(gym.Env):
                 info["docking_score"] = res.get("docking_score", None)
                 info["mw"] = res.get("mw", 0.0)
 
-                # Structural diversity check via Morgan fingerprint similarity
-                if res["valid"]:
-                    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
-                    if self.local_seen_fps:
-                        sims = DataStructs.BulkTanimotoSimilarity(fp, self.local_seen_fps)
-                        if max(sims) > 0.75:
-                            reward -= 3.0
-                            info["diversity_penalty"] = True
-                        else:
-                            self.local_seen_fps.append(fp)
-                            info["diversity_penalty"] = False
-                    else:
-                        self.local_seen_fps.append(fp)
-                        info["diversity_penalty"] = False
+                # Internal diversity check is managed by RewardOracle against recent candidates
+                info["max_tanimoto"] = res.get("max_tanimoto", 0.0)
+                info["diversity_penalty"] = (res.get("diversity_penalty", 0.0) > 0.0)
             else:
                 reward = -5.0
                 info["smiles"] = cleaned_smiles
@@ -358,6 +348,8 @@ class MoleculeLoggingCallback(BaseCallback):
             self.logger.record("molecules/best_reward", self.best_reward)
             if docking is not None:
                 self.logger.record("molecules/best_docking", self.best_docking)
+            if "max_tanimoto" in info:
+                self.logger.record("molecules/max_tanimoto", info["max_tanimoto"])
 
             # Periodic Console Summary
             if self.total_episodes % self.summary_freq == 0:
@@ -579,6 +571,7 @@ def train(
             ent_coef=config["ent_coef"],
             clip_range=config["clip_range"],
             max_grad_norm=config["max_grad_norm"],
+            target_kl=config.get("target_kl", None),
             verbose=1,
             device="cuda" if torch.cuda.is_available() else "cpu",
             tensorboard_log=config["log_dir"],
@@ -651,8 +644,8 @@ if __name__ == "__main__":
         help="Path to a checkpoint .zip to resume from (e.g. checkpoints/hpc_run/ppo_molgpt_hpc_50000_steps.zip)"
     )
     parser.add_argument(
-        "--n-envs", type=int, default=16,
-        help="Number of parallel environments (default: 16 for HPC; use 4-8 if CPU cores are limited)"
+        "--n-envs", type=int, default=32,
+        help="Number of parallel environments (default: 32 for HPC with 64 GB RAM; use 4-8 if cores are limited)"
     )
     parser.add_argument(
         "--vec-env", type=str, choices=["subproc", "dummy"], default="subproc",

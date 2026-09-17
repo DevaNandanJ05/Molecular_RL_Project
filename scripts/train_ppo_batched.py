@@ -56,7 +56,6 @@ class MolGenEnv(gym.Env):
         
         target_path = os.path.join(project_root, "data", "raw", "drd2_clean.pdbqt")
         self.oracle = RewardOracle(receptor_pdbqt_path=target_path)
-        self.local_seen_fps = []
         
         self.seq = np.full((self.max_length,), self.pad_token_id, dtype=np.int32)
         self.step_idx = 1
@@ -89,19 +88,10 @@ class MolGenEnv(gym.Env):
                 res = self.oracle.evaluate_smiles(valid_smiles, run_docking=True)
                 reward = res["total_reward"]
                 
-                # Structural diversity penalty
-                if res["valid"]:
-                    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
-                    if self.local_seen_fps:
-                        sims = DataStructs.BulkTanimotoSimilarity(fp, self.local_seen_fps)
-                        if max(sims) > 0.75:
-                            reward -= 3.0
-                        else:
-                            self.local_seen_fps.append(fp)
-                    else:
-                        self.local_seen_fps.append(fp)
+                # Internal diversity penalty is calculated within RewardOracle against recent candidates
+                pass
             else:
-                reward = -5.0 # Syntax penalty
+                reward = -5.0  # Syntax penalty
                 
         return self.seq.copy(), float(reward), terminated, False, {}
 
