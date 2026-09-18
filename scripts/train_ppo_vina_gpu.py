@@ -134,16 +134,16 @@ def get_vina_gpu_config() -> dict:
         "n_steps": 512,                # 512 × 12 = 6,144 transitions per rollout
         "batch_size": 256,             # Smaller batch — smaller network to update
         "n_epochs": 6,                 # More epochs — no catastrophic forgetting risk
-        "learning_rate": 3e-4,         # High LR — only training a linear action head
+        "learning_rate": 1e-4,         # Stable LR for linear action head
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "ent_coef": 0.01,              # Low entropy — pretrained dist already diverse
+        "ent_coef": 0.005,             # Controlled entropy to avoid aggressive distribution shift
         "clip_range": 0.2,             # Standard PPO clip
-        "max_grad_norm": 1.0,          # Relaxed — linear head has no forgetting risk
-        "target_kl": None,             # Disable KL early-stop for linear head phase
-        # NOTE: Each token can represent multiple SMILES characters (e.g. token 116
-        # = 'c1ccccc1'). 20 fragment-tokens is enough for any drug-like molecule.
-        "max_length": 20,
+        "max_grad_norm": 1.0,          # Clip gradients
+        "target_kl": 0.03,             # Guardrail to prevent KL explosion / policy collapse
+        # NOTE: Each token represents a SMILES fragment (e.g. token 116 = 'c1ccccc1').
+        # 25 fragment-tokens is plenty for drug-like molecules (MW 300-500).
+        "max_length": 25,
 
         # ---- Training Duration ----
         "total_timesteps": 10_000_000,
@@ -156,8 +156,8 @@ def get_vina_gpu_config() -> dict:
         "vf_net_arch": [512, 256],     # Smaller value net — simpler features
 
         # ---- Curriculum Learning ----
-        # Warmup is much shorter now — grammar preserved = valid mols from step 1
-        "curriculum_warmup_episodes": 500,
+        # 100 episodes per worker = 1,200 global episodes before full CPU docking starts
+        "curriculum_warmup_episodes": 100,
 
         # ---- Top-K Experience Replay ----
         "topk_buffer_size": 100,
@@ -471,7 +471,7 @@ class RewardOracleVinaGPU:
         
         if mol is None:
             return {
-                "valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0,
+                "valid": False, "qed": 0.0, "docking_score": None, "total_reward": -5.0,
                 "max_tanimoto": 0.0, "diversity_penalty": 0.0
             }
         
@@ -479,13 +479,13 @@ class RewardOracleVinaGPU:
             Chem.SanitizeMol(mol)
         except Exception:
             return {
-                "valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0,
+                "valid": False, "qed": 0.0, "docking_score": None, "total_reward": -5.0,
                 "max_tanimoto": 0.0, "diversity_penalty": 0.0
             }
 
         if len(smiles.strip()) < 3:
             return {
-                "valid": False, "qed": 0.0, "docking_score": 0.0, "total_reward": -5.0,
+                "valid": False, "qed": 0.0, "docking_score": None, "total_reward": -5.0,
                 "max_tanimoto": 0.0, "diversity_penalty": 0.0
             }
             
@@ -797,38 +797,44 @@ class MolGenEnvVinaGPU(gym.Env):
         reward = 0.0
         info = {}
 
-        # ── Early-termination on valid SMILES ─────────────────────────────
-        # msb-roshan/molgpt uses fragment-level tokenization: each token can
-        # represent multiple SMILES characters (e.g. token 116 = 'c1ccccc1',
-        # token 69 = 'CC', token 120 = 'CCO'). Waiting for EOS or max_length
-        # concatenates fragments into invalid mega-strings.
-        # Solution: decode after every token and terminate as soon as the
-        # current fragment sequence parses as a valid SMILES molecule.
+        # ── Smart termination on drug-sized SMILES or EOS ─────────────────
+        # MolGPT uses fragment-level tokenization. Small 1-token fragments
+        # (like 'CC' or 'c1ccccc1') are already valid molecules to RDKit.
+        # Terminating on any valid SMILES stops generation at Step 1 or 2,
+        # preventing the policy from generating drug-sized molecules (MW 300-500).
+        # We only early-terminate when the sequence forms a drug-sized molecule
+        # (MW >= 160 or heavy atoms >= 12), OR when EOS / max_length is hit.
         token_list = self.seq[:self.step_idx].tolist()
         raw_smiles = self.tokenizer.decode(token_list, skip_special_tokens=True).strip()
         cleaned_smiles = raw_smiles.replace(" ", "").split(".")[0]
         mid_mol = Chem.MolFromSmiles(cleaned_smiles) if len(cleaned_smiles) >= 1 else None
 
+        is_drug_sized = False
+        if mid_mol is not None:
+            try:
+                is_drug_sized = (Descriptors.MolWt(mid_mol) >= 160.0 or mid_mol.GetNumHeavyAtoms() >= 12)
+            except Exception:
+                is_drug_sized = False
+
         force_end = (action == self.eos_token_id or self.step_idx >= self.max_length)
 
-        if mid_mol is not None or force_end:
+        if is_drug_sized or force_end:
             terminated = True
             self.episode_count += 1
+
+            # ── Curriculum Learning ────────────────────────────────────
+            # Phase 1 (warmup): QED-only rewards for rapid grammar learning.
+            # Phase 2 (full):   CPU docking enabled once grammar is stable.
+            use_docking = self.episode_count > self.curriculum_warmup_episodes
+            if not self._warmup_logged and use_docking:
+                self._warmup_logged = True
+                print(f"[Worker {os.getpid()}] Curriculum warmup complete "
+                      f"({self.curriculum_warmup_episodes} episodes). "
+                      f"Docking is now ENABLED.")
 
             mol = mid_mol
             if mol is not None:
                 valid_smiles = Chem.MolToSmiles(mol)
-
-                # ── Curriculum Learning ────────────────────────────────────
-                # Phase 1 (warmup): QED-only rewards for rapid grammar learning.
-                # Phase 2 (full):   CPU docking enabled once grammar is stable.
-                use_docking = self.episode_count > self.curriculum_warmup_episodes
-                if not self._warmup_logged and use_docking:
-                    self._warmup_logged = True
-                    print(f"[Worker {os.getpid()}] Curriculum warmup complete "
-                          f"({self.curriculum_warmup_episodes} episodes). "
-                          f"Docking is now ENABLED.")
-
                 res = self.oracle.evaluate_smiles(valid_smiles, run_docking=use_docking)
                 reward = res["total_reward"]
 
@@ -868,6 +874,7 @@ class MolGenEnvVinaGPU(gym.Env):
                 reward = -5.0
                 info["smiles"] = cleaned_smiles
                 info["valid"] = False
+                info["curriculum_phase"] = "docking" if use_docking else "warmup"
                 info["episode_length"] = self.step_idx
 
         return self.seq.copy(), float(reward), terminated, False, info
@@ -973,6 +980,7 @@ class MoleculeLoggingCallback(BaseCallback):
         self.best_reward = float("-inf")
         self.best_docking = float("inf")
         self.best_smiles = ""
+        self.best_reward_smiles = ""
         self.total_valid = 0
         self.total_episodes = 0
         self.unique_smiles = set()
@@ -1006,12 +1014,13 @@ class MoleculeLoggingCallback(BaseCallback):
                 self.unique_smiles.add(info["smiles"])
 
             docking = info.get("docking_score", None)
-            if docking is not None and docking < self.best_docking:
+            if docking is not None and docking < 0.0 and docking < self.best_docking:
                 self.best_docking = docking
                 self.best_smiles = info.get("smiles", "")
 
-            if reward > self.best_reward:
+            if reward > self.best_reward and is_valid:
                 self.best_reward = reward
+                self.best_reward_smiles = info.get("smiles", "")
 
             validity_rate = self.total_valid / max(self.total_episodes, 1)
 
@@ -1032,7 +1041,7 @@ class MoleculeLoggingCallback(BaseCallback):
             self.logger.record("molecules/unique_count", len(self.unique_smiles))
             self.logger.record("molecules/total_episodes", self.total_episodes)
             self.logger.record("molecules/best_reward", self.best_reward)
-            if docking is not None:
+            if self.best_docking != float("inf"):
                 self.logger.record("molecules/best_docking", self.best_docking)
             if "max_tanimoto" in info:
                 self.logger.record("molecules/max_tanimoto", info["max_tanimoto"])
@@ -1045,13 +1054,14 @@ class MoleculeLoggingCallback(BaseCallback):
                 eta = self._estimate_eta(elapsed_h)
                 best_dock_str = f"{self.best_docking:.2f} kcal/mol" if self.best_docking != float("inf") else "N/A"
                 phase_str = "[DOCKING]" if phase == "docking" else "[WARMUP (QED-only)]"
+                top_cand = self.best_smiles if self.best_smiles else (self.best_reward_smiles or "N/A")
                 print(
                     f"\n{'='*70}\n"
                     f"  Episode {self.total_episodes:,}  |  Step {self.num_timesteps:,}  |  "
                     f"{elapsed_h:.1f} h elapsed  |  ETA: {eta}\n"
                     f"  Validity: {validity_rate:.1%}  |  Unique Molecules: {len(self.unique_smiles):,}  |  "
                     f"Best Dock: {best_dock_str}  |  Best Reward: {self.best_reward:.2f}\n"
-                    f"  Top Candidate: {self.best_smiles}\n"
+                    f"  Top Candidate: {top_cand}\n"
                     f"  Phase: {phase_str}\n"
                     f"{'='*70}"
                 )
