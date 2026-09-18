@@ -118,37 +118,44 @@ def get_vina_gpu_config() -> dict:
         "obabel_path": resolve_obabel_path(),
 
         # ---- Parallelism ----
-        "n_envs": 32,                  # Parallel CPU docking workers
+        # 12 workers fits comfortably in 32 GB RAM with frozen MolGPT
+        # (unfrozen would require ~13 GB/process — 32 workers × 350 MB workers = 11.2 GB
+        #  + 13 GB main process = RAM thrash. Frozen saves ~10 GB total.)
+        "n_envs": 12,
         "vec_env": "subproc",
 
         # ---- Docking (CPU AutoDock Vina) ----
-        "vina_exhaustiveness": 4,      # Reduced for CPU throughput (re-dock top hits at 32 post-training)
-        "vina_cpu_threads": 1,         # 1 CPU core per worker to prevent Windows thread thrashing
+        "vina_exhaustiveness": 4,      # Low exhaustiveness for training throughput
+        "vina_cpu_threads": 1,         # 1 CPU core per worker to prevent thread thrashing
 
-        # ---- PPO Hyperparameters ----
-        "n_steps": 512,                # 512 × 32 = 16,384 transitions per rollout
-        "batch_size": 512,
-        "n_epochs": 4,                 # Conservative 4 epochs to prevent policy drift
-        "learning_rate": 5e-6,         # Stabilized LR to protect MolGPT grammar
+        # ---- PPO Hyperparameters (tuned for FROZEN MolGPT backbone) ----
+        # With MolGPT frozen, only the small action/value heads are trained.
+        # This allows a much higher LR, more epochs, and relaxed clipping.
+        "n_steps": 512,                # 512 × 12 = 6,144 transitions per rollout
+        "batch_size": 256,             # Smaller batch — smaller network to update
+        "n_epochs": 6,                 # More epochs — no catastrophic forgetting risk
+        "learning_rate": 3e-4,         # High LR — only training a linear action head
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "ent_coef": 0.04,              # Entropy bonus for exploration diversity
-        "clip_range": 0.15,            # Tighter clipping for stability
-        "max_grad_norm": 0.5,
-        "target_kl": 0.03,             # Early-stop PPO epochs on KL divergence
+        "ent_coef": 0.01,              # Low entropy — pretrained dist already diverse
+        "clip_range": 0.2,             # Standard PPO clip
+        "max_grad_norm": 1.0,          # Relaxed — linear head has no forgetting risk
+        "target_kl": None,             # Disable KL early-stop for linear head phase
         "max_length": 50,
 
         # ---- Training Duration ----
         "total_timesteps": 10_000_000,
 
         # ---- Model Architecture ----
-        "unfreeze_molgpt": True,
-        "vf_net_arch": [1024, 512, 256],
+        # PHASE 1: Freeze MolGPT — only train action + value heads
+        # Grammar is preserved. Validity recovers to ~80%+ immediately.
+        # PHASE 2 (later): Set unfreeze_molgpt=True with lr=5e-7 to fine-tune.
+        "unfreeze_molgpt": False,
+        "vf_net_arch": [512, 256],     # Smaller value net — simpler features
 
         # ---- Curriculum Learning ----
-        # Phase 1 (warmup): Only QED-based rewards, no docking (runs ~50× faster)
-        # Phase 2 (full):   Full CPU docking enabled once grammar is learned
-        "curriculum_warmup_episodes": 5000,
+        # Warmup is much shorter now — grammar preserved = valid mols from step 1
+        "curriculum_warmup_episodes": 500,
 
         # ---- Top-K Experience Replay ----
         "topk_buffer_size": 100,
@@ -162,8 +169,8 @@ def get_vina_gpu_config() -> dict:
         # ---- Checkpointing & Logging ----
         "checkpoint_freq": 10_000,
         "log_summary_freq": 50,
-        "checkpoint_dir": os.path.join(project_root, "checkpoints", "hpc_cpu_run"),
-        "log_dir": os.path.join(project_root, "logs", "hpc_cpu_run"),
+        "checkpoint_dir": os.path.join(project_root, "checkpoints", "hpc_frozen_run"),
+        "log_dir": os.path.join(project_root, "logs", "hpc_frozen_run"),
     }
 
 VINA_GPU_CONFIG = get_vina_gpu_config()
