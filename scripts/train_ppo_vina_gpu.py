@@ -98,6 +98,10 @@ def resolve_vina_cpu_path(custom_path=None) -> str:
 
     return custom_path or bin_cpu  # Return expected path even if missing (pre-flight will catch it)
 
+def resolve_vina_gpu_path(custom_path=None) -> str:
+    """Compatibility alias for resolve_vina_cpu_path while GPU docking is disabled."""
+    return resolve_vina_cpu_path(custom_path)
+
 # ============================================================================
 # WINDOWS HPC CONFIGURATION
 # ============================================================================
@@ -105,10 +109,12 @@ def get_vina_gpu_config() -> dict:
     """Returns the default configuration.
     NOTE: Docking now runs on CPU AutoDock Vina (vina.exe). GPU docking is
     disabled until Vina-GPU-2.1 is rebuilt with matching CUDA kernel assets."""
+    cpu_vina = resolve_vina_cpu_path()
     return {
         # ---- File Paths ----
         "receptor_path": os.path.join(project_root, "data", "raw", "drd2_clean.pdbqt"),
-        "vina_cpu_executable": resolve_vina_cpu_path(),   # CPU vina.exe (GPU disabled)
+        "vina_cpu_executable": cpu_vina,   # CPU vina.exe (GPU disabled)
+        "vina_gpu_executable": cpu_vina,   # Alias to avoid KeyError in any caller
         "obabel_path": resolve_obabel_path(),
 
         # ---- Parallelism ----
@@ -1064,48 +1070,47 @@ class MoleculeLoggingCallback(BaseCallback):
 # ============================================================================
 def run_preflight_checks(config: dict) -> bool:
     print("\n" + "=" * 70)
-    print("  WINDOWS HPC PRE-FLIGHT VERIFICATION (VINA-GPU)")
+    print("  WINDOWS HPC PRE-FLIGHT VERIFICATION (CPU DOCKING MODE)")
     print("=" * 70)
 
     cuda_ok = torch.cuda.is_available()
     if cuda_ok:
         device_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"  [PASS] CUDA Available     : Yes ({device_name}, {vram_gb:.1f} GB VRAM)")
+        print(f"  [PASS] CUDA Available     : Yes ({device_name}, {vram_gb:.1f} GB VRAM) [PyTorch/PPO]")
     else:
-        print("  [FAIL] CUDA Available     : NO (Vina-GPU requires an NVIDIA GPU!)")
-        return False
+        print("  [INFO] CUDA Available     : No (PyTorch/PPO running on CPU)")
 
-    receptor = config["receptor_path"]
-    if os.path.isfile(receptor):
+    receptor = config.get("receptor_path")
+    if receptor and os.path.isfile(receptor):
         size_kb = os.path.getsize(receptor) / 1024
         print(f"  [PASS] Receptor PDBQT     : Found ({receptor}, {size_kb:.1f} KB)")
     else:
         print(f"  [FAIL] Receptor PDBQT     : NOT FOUND at {receptor}")
         return False
 
-    obabel = config["obabel_path"]
-    if os.path.isfile(obabel):
+    obabel = config.get("obabel_path")
+    if obabel and os.path.isfile(obabel):
         print(f"  [PASS] OpenBabel Binary   : Found at {obabel}")
     else:
         print(f"  [FAIL] OpenBabel Binary   : NOT FOUND at {obabel}")
         return False
 
-    vina_path = config["vina_gpu_executable"]
-    if os.path.isfile(vina_path):
-        is_gpu = "vina-gpu" in os.path.basename(vina_path).lower()
-        engine_label = "Vina-GPU 2.1 (GPU Docking)" if is_gpu else "AutoDock Vina (CPU Fallback)"
-        print(f"  [PASS] Docking Engine     : Found at {vina_path} [{engine_label}]")
+    vina_path = config.get("vina_cpu_executable") or config.get("vina_gpu_executable") or resolve_vina_cpu_path()
+    if vina_path and os.path.isfile(vina_path):
+        config["vina_cpu_executable"] = vina_path
+        config["vina_gpu_executable"] = vina_path
+        print(f"  [PASS] Docking Engine     : Found at {vina_path} [AutoDock Vina CPU]")
     else:
         # Check if CPU vina exists in bin as fallback
         cpu_vina = os.path.join(project_root, "bin", "vina.exe")
         if os.path.isfile(cpu_vina):
+            config["vina_cpu_executable"] = cpu_vina
             config["vina_gpu_executable"] = cpu_vina
-            print(f"  [WARN] Vina-GPU Binary    : NOT FOUND at {vina_path}")
-            print(f"  [PASS] Docking Engine     : Falling back to {cpu_vina} [AutoDock Vina CPU]")
+            print(f"  [PASS] Docking Engine     : Found at {cpu_vina} [AutoDock Vina CPU]")
         else:
             print(f"  [FAIL] Docking Engine     : NOT FOUND at {vina_path} or bin/vina.exe")
-            print("         Please place Vina-GPU.exe or vina.exe in the bin folder.")
+            print("         Please place vina.exe in the bin folder.")
             return False
 
     print("=" * 70 + "\n")
@@ -1123,7 +1128,8 @@ def train(
     batch_size: int = None,
     no_save: bool = False,
     summary_freq: int = None,
-    vina_cpu_executable: str = None,   # renamed from vina_gpu_executable; GPU docking disabled
+    vina_cpu_executable: str = None,
+    vina_gpu_executable: str = None,
     obabel_path: str = None,
     receptor_path: str = None,
 ):
@@ -1135,7 +1141,10 @@ def train(
     if n_steps is not None: config["n_steps"] = n_steps
     if batch_size is not None: config["batch_size"] = batch_size
     if summary_freq is not None: config["log_summary_freq"] = summary_freq
-    if vina_cpu_executable: config["vina_cpu_executable"] = os.path.abspath(vina_cpu_executable)
+    chosen_vina = vina_cpu_executable or vina_gpu_executable
+    if chosen_vina:
+        config["vina_cpu_executable"] = os.path.abspath(chosen_vina)
+        config["vina_gpu_executable"] = config["vina_cpu_executable"]
     if obabel_path: config["obabel_path"] = os.path.abspath(obabel_path)
     if receptor_path: config["receptor_path"] = os.path.abspath(receptor_path)
 
@@ -1303,10 +1312,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-save", action="store_true", help="Skip saving large checkpoint files (prevents disk thrashing during tests)")
     parser.add_argument("--summary-freq", type=int, default=None, help="Molecule summary frequency")
     parser.add_argument("--vina-path", type=str, default=None, help="Path to vina.exe (CPU docking)")
+    parser.add_argument("--vina-gpu-path", type=str, default=None, help="Compatibility alias for --vina-path")
     parser.add_argument("--obabel-path", type=str, default=None)
     parser.add_argument("--receptor-path", type=str, default=None)
 
     args = parser.parse_args()
+    chosen_vina = args.vina_path or args.vina_gpu_path
     train(
         resume_from=args.resume,
         n_envs=args.n_envs,
@@ -1316,7 +1327,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         no_save=args.no_save,
         summary_freq=args.summary_freq,
-        vina_cpu_executable=args.vina_path,
+        vina_cpu_executable=chosen_vina,
+        vina_gpu_executable=chosen_vina,
         obabel_path=args.obabel_path,
         receptor_path=args.receptor_path,
     )
