@@ -639,6 +639,41 @@ class RewardOracleVinaGPU:
                 return None
 
             if result.returncode != 0:
+                # Detect fatal Windows native crash codes (not normal Vina errors).
+                # 0xC0000409 = STATUS_STACK_BUFFER_OVERRUN: the compiled Vina-GPU.exe
+                # binary or its OpenCL kernels are corrupt / mismatched with the driver.
+                # Treating this as a silent docking failure masks a critical build issue.
+                FATAL_WIN32_CRASH_CODES = {
+                    3221226505,  # 0xC0000409 STATUS_STACK_BUFFER_OVERRUN (bad kernel build)
+                    3221225477,  # 0xC0000005 ACCESS_VIOLATION
+                    3221225725,  # 0xC000009D STATUS_DEVICE_NOT_CONNECTED
+                }
+                if result.returncode in FATAL_WIN32_CRASH_CODES or result.returncode < -1:
+                    if not hasattr(self, '_gpu_crash_count'):
+                        self._gpu_crash_count = 0
+                    self._gpu_crash_count += 1
+                    if self._gpu_crash_count == 1:
+                        self._logger.critical(
+                            f"\n{'='*70}\n"
+                            f"[CRITICAL] Vina-GPU.exe crashed with fatal Windows error code: "
+                            f"{result.returncode} (0x{result.returncode & 0xFFFFFFFF:08X}).\n"
+                            f"This means the compiled Vina-GPU binary or its OpenCL kernels are "
+                            f"INCOMPATIBLE with this GPU/driver. This is NOT a Python error.\n"
+                            f"ACTION REQUIRED: Rebuild Vina-GPU from the correct source:\n"
+                            f"  git clone https://github.com/DeltaGroupNJUPT/Vina-GPU-2.1.git\n"
+                            f"See vscode_agent_hpc_instructions.md Phase 1 for full instructions.\n"
+                            f"Automatically falling back to CPU Vina for this worker.\n"
+                            f"{'='*70}"
+                        )
+                    # After 3 crashes, permanently switch this oracle instance to CPU mode
+                    if self._gpu_crash_count >= 3:
+                        cpu_vina = os.path.join(project_root, "bin", "vina.exe")
+                        if os.path.isfile(cpu_vina):
+                            self._logger.warning(
+                                f"[Docking] GPU crashed {self._gpu_crash_count}x. "
+                                f"Permanently switching worker to CPU Vina: {cpu_vina}"
+                            )
+                            self.vina_gpu_executable = cpu_vina
                 return None
 
             # Parse docking score using robust regex

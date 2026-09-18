@@ -11,37 +11,107 @@ This document provides explicit instructions for the AI Agent (e.g., VS Code Cop
 
 To guarantee the compiled kernel perfectly matches the HPC's GPU architecture (e.g., RTX 3060/3090), you must compile Vina-GPU 2.1 natively.
 
-### Step 1: Install Visual Studio & Boost
-1. **Visual Studio:** Ensure the HPC has **Visual Studio 2019** or **2022** installed with the **"Desktop development with C++"** workload.
-2. **Download Boost:** Ensure **Boost 1.77.0** (or similar 1.7x version) source or precompiled Windows binaries are extracted (e.g., `C:\local\boost_1_77_0`).
+### Step 1: Install Visual Studio, CUDA Toolkit & Boost
 
-### Step 2: Clone the Vina-GPU Repository
-Open PowerShell on the HPC and clone the repository outside the main project (e.g., in a temp or tools folder):
-```bash
-git clone https://github.com/DeltaGroupNJU/Vina-GPU.git
-cd Vina-GPU
+> [!CAUTION]
+> **Do NOT use `DeltaGroupNJU/Vina-GPU.git`.** That is the stale original repo with no valid `HEAD` and corrupted kernel assets. Using it produces the fatal `0xC0000409 STATUS_STACK_BUFFER_OVERRUN` crash. Always use the correct `DeltaGroupNJUPT/Vina-GPU-2.1.git` repo.
+
+1. **Visual Studio:** Ensure the HPC has **Visual Studio 2019** or **2022** with the **"Desktop development with C++"** workload installed.
+2. **CUDA Toolkit:** Install the CUDA Toolkit version matching your driver (e.g., CUDA 12.x for RTX 3060). Download from:
+   👉 **https://developer.nvidia.com/cuda-downloads**
+   Verify installation: `nvcc --version`
+3. **Boost 1.77.0 (REQUIRED — precompiled binaries for MSVC):**
+   Download the precompiled Boost 1.77.0 binaries for MSVC 2019/2022 directly:
+   👉 **https://sourceforge.net/projects/boost/files/boost-binaries/1.77.0/boost_1_77_0-msvc-14.2-64.exe/download**
+   - Run the installer and extract to `C:\local\boost_1_77_0`
+   - Verify the folder `C:\local\boost_1_77_0\lib64-msvc-14.2` exists and contains `.lib` files.
+   - If the installer link is unavailable, use the source distribution:
+     👉 **https://boostorg.jfrog.io/artifactory/main/release/1.77.0/source/boost_1_77_0.zip**
+     Extract it, then open a VS 2019 Developer Command Prompt and run:
+     ```cmd
+     cd C:\local\boost_1_77_0
+     bootstrap.bat
+     b2 address-model=64 link=static runtime-link=shared threading=multi --with-thread --with-filesystem --with-system
+     ```
+
+### Step 2: Clone the CORRECT Vina-GPU 2.1 Repository
+
+> [!IMPORTANT]
+> The correct upstream repository is `DeltaGroupNJUPT/Vina-GPU-2.1`. Clone it to a location **outside** your main project folder (e.g., `C:\tools\`).
+
+Open PowerShell on the HPC:
+```powershell
+mkdir C:\tools
+cd C:\tools
+git clone https://github.com/DeltaGroupNJUPT/Vina-GPU-2.1.git
+cd Vina-GPU-2.1
+git log --oneline -5   # Verify: this must show real commits, NOT "fatal: bad default revision"
 ```
 
 ### Step 3: Configure the Visual Studio Project
-1. Open the **`Vina-GPU.sln`** solution file in Visual Studio.
+1. Open **`C:\tools\Vina-GPU-2.1\Vina-GPU.sln`** in Visual Studio.
 2. At the top of the window, change the build configuration dropdowns from `Debug` and `x86` to **`Release`** and **`x64`**.
-3. Right-click the **Vina-GPU** project in the Solution Explorer and click **Properties**.
+3. Right-click the **Vina-GPU** project in Solution Explorer → click **Properties**.
 
-### Step 4: Link Boost to the Project
-In the Project Properties window:
-1. **Include Directories:** Go to `C/C++` -> `General` -> `Additional Include Directories`. Add the path to the Boost extraction folder (e.g., `C:\local\boost_1_77_0`).
-2. **Library Directories:** Go to `Linker` -> `General` -> `Additional Library Directories`. Add the path to the Boost compiled libraries folder (e.g., `C:\local\boost_1_77_0\stage\lib` or `C:\local\boost_1_77_0\lib64-msvc-14.2`).
-3. Click **Apply** and **OK**.
+### Step 4: Link Boost & CUDA to the Project
+In the Project Properties window, configure the following:
+
+1. **Include Directories** (`C/C++` → `General` → `Additional Include Directories`). Add:
+   ```
+   C:\local\boost_1_77_0
+   C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\include
+   ```
+2. **Library Directories** (`Linker` → `General` → `Additional Library Directories`). Add:
+   ```
+   C:\local\boost_1_77_0\lib64-msvc-14.2
+   C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\lib\x64
+   ```
+3. **Additional Dependencies** (`Linker` → `Input` → `Additional Dependencies`). Add:
+   ```
+   OpenCL.lib
+   ```
+4. Click **Apply** and **OK**.
 
 ### Step 5: Build the Executable
-1. Go to the top menu bar: **Build** -> **Build Solution** (or press `Ctrl+Shift+B`).
-2. If successful, it will generate **`Vina-GPU.exe`** in the `x64\Release` folder of the cloned repository.
+1. Go to **Build** → **Build Solution** (or press `Ctrl+Shift+B`).
+2. If successful, you will see output like:
+   ```
+   ========== Build: 1 succeeded, 0 failed ==========
+   ```
+   The output file will be at: `C:\tools\Vina-GPU-2.1\x64\Release\Vina-GPU.exe`
 
-### Step 6: Move Files to the RL Project
-1. In the root of the `Molecular_RL_Project` directory, create a folder called `vina_gpu_bin`.
-2. Copy the newly compiled **`Vina-GPU.exe`** into `vina_gpu_bin`.
-3. Go to the original `Vina-GPU\OpenCL` folder you cloned, and copy **all the `.cl` files** (like `kernel1.cl`, `kernel2.cl`) and `lib/` files into your new `vina_gpu_bin` folder.
-4. *(If dynamically linking Boost)*: Copy the necessary `boost_*.dll` files from your Boost folder into `vina_gpu_bin` as well.
+### Step 6: Move ALL Required Files to the Project
+
+> [!IMPORTANT]
+> `Vina-GPU.exe` **cannot** run alone. It requires the OpenCL kernel source files in the same directory. Forgetting these causes the `0xC0000409` crash.
+
+```powershell
+# Create the bin folder in your project
+New-Item -ItemType Directory -Force -Path "c:\Users\devan\OneDrive\Desktop\final project\bin"
+
+# Copy the executable
+Copy-Item "C:\tools\Vina-GPU-2.1\x64\Release\Vina-GPU.exe" "c:\Users\devan\OneDrive\Desktop\final project\bin\"
+
+# Copy ALL kernel source files (.cl) - these are MANDATORY
+Copy-Item "C:\tools\Vina-GPU-2.1\OpenCL\*.cl" "c:\Users\devan\OneDrive\Desktop\final project\bin\"
+
+# Verify:
+Get-ChildItem "c:\Users\devan\OneDrive\Desktop\final project\bin\"
+# Expected: Vina-GPU.exe, Kernel1.cl, Kernel2.cl (at minimum)
+```
+
+### Step 7: First Run — Kernel Compilation (30-60 seconds, one time only)
+On the very first run:
+- Vina-GPU reads the `.cl` files and compiles them for your exact GPU.
+- It generates `Kernel1_code.bin` and `Kernel2_code.bin` in the `bin/` folder.
+- All subsequent runs will load the `.bin` files instantly.
+
+**Test the executable directly before using it in training:**
+```powershell
+cd "c:\Users\devan\OneDrive\Desktop\final project"
+.\bin\Vina-GPU.exe --help
+# If it prints usage options (not a crash), the build is valid.
+```
 
 ---
 
@@ -113,6 +183,8 @@ python -m tensorboard.main --logdir logs\vina_gpu_run --port 6006
 ```
 
 ### Troubleshooting Edge Cases
-- **Disk Thrashing / OneDrive Sync Issues:** If high disk I/O or OneDrive lagging occurs, use `--no-save` during debugging, or ensure the `checkpoints/` directory is excluded from OneDrive sync.
+- **`0xC0000409` / `STATUS_STACK_BUFFER_OVERRUN` crash:** The compiled `Vina-GPU.exe` binary or its OpenCL kernels are corrupt or mismatched with the GPU driver. This is NOT a Python or docking error. **Fix:** Delete `bin/Vina-GPU.exe` and all `.bin` / `.cl` files. Rebuild from the correct source (`DeltaGroupNJUPT/Vina-GPU-2.1.git`) following Phase 1 above. The Python script will now log a `[CRITICAL]` message and automatically fall back to CPU Vina if this is detected.
+- **`0xC0000005` / ACCESS_VIOLATION crash:** Same cause as above — corrupt or mismatched kernels/build.
+- **Disk Thrashing / OneDrive Sync Issues:** Use `--no-save` during debugging, or exclude `checkpoints/` from OneDrive sync.
 - **Encoding Errors (`cp1252`):** The script enforces UTF-8 output via `sys.stdout.reconfigure(encoding='utf-8')`. If Unicode errors occur in child processes, check subprocess execution in `models/reward_oracle.py`.
 - **Worker Hangs:** `train_ppo_vina_gpu.py` implements multiprocessing timeouts (120s max per docking). If a worker hangs, the environment resets the episode to prevent deadlocks. Look for `TimeoutExpired` warnings.
