@@ -76,85 +76,88 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.logger import configure
 
 # ============================================================================
-# VINA-GPU PATH RESOLUTION
+# VINA CPU PATH RESOLUTION
+# NOTE: Vina-GPU (CUDA) is disabled due to current CUDA build incompatibility.
+#       All docking runs on the CPU AutoDock Vina engine (vina.exe).
 # ============================================================================
-def resolve_vina_gpu_path(custom_path=None) -> str:
-    """Locates Vina-GPU.exe in the project bin directory or via custom path.
-    Falls back to bin/vina.exe if Vina-GPU is not yet compiled/installed."""
+def resolve_vina_cpu_path(custom_path=None) -> str:
+    """Locates AutoDock Vina CPU (vina.exe) in the project bin directory."""
     if custom_path and os.path.isfile(custom_path):
         return os.path.abspath(custom_path)
-    
-    bin_path = os.path.join(project_root, "bin", "Vina-GPU.exe")
-    if os.path.isfile(bin_path):
-        return bin_path
-        
-    default_gpu = r"C:\Vina-GPU\Vina-GPU.exe"
-    if os.path.isfile(default_gpu):
-        return default_gpu
 
+    # Primary: project-local bin/vina.exe
     bin_cpu = os.path.join(project_root, "bin", "vina.exe")
     if os.path.isfile(bin_cpu):
         return bin_cpu
 
-    return custom_path or bin_path
+    # Secondary: system PATH (installed globally)
+    import shutil as _shutil
+    sys_vina = _shutil.which("vina")
+    if sys_vina:
+        return sys_vina
+
+    return custom_path or bin_cpu  # Return expected path even if missing (pre-flight will catch it)
 
 # ============================================================================
 # WINDOWS HPC CONFIGURATION
 # ============================================================================
 def get_vina_gpu_config() -> dict:
-    """Returns the default configuration optimized for Vina-GPU on RTX GPUs."""
+    """Returns the default configuration.
+    NOTE: Docking now runs on CPU AutoDock Vina (vina.exe). GPU docking is
+    disabled until Vina-GPU-2.1 is rebuilt with matching CUDA kernel assets."""
     return {
         # ---- File Paths ----
         "receptor_path": os.path.join(project_root, "data", "raw", "drd2_clean.pdbqt"),
-        "vina_gpu_executable": resolve_vina_gpu_path(),
+        "vina_cpu_executable": resolve_vina_cpu_path(),   # CPU vina.exe (GPU disabled)
         "obabel_path": resolve_obabel_path(),
 
         # ---- Parallelism ----
-        "n_envs": 32,                  # High parallel workers to batch ligands to GPU
+        "n_envs": 32,                  # Parallel CPU docking workers
         "vec_env": "subproc",
 
-        # ---- Docking ----
-        "vina_exhaustiveness": 8,      # Can afford higher exhaustiveness on GPU (search_depth in Vina-GPU)
+        # ---- Docking (CPU AutoDock Vina) ----
+        "vina_exhaustiveness": 4,      # Reduced for CPU throughput (re-dock top hits at 32 post-training)
+        "vina_cpu_threads": 1,         # 1 CPU core per worker to prevent Windows thread thrashing
 
-        # ---- PPO Hyperparameters (Stabilized for RTX 3060 12 GB) ----
+        # ---- PPO Hyperparameters ----
         "n_steps": 512,                # 512 × 32 = 16,384 transitions per rollout
-        "batch_size": 512,             # Larger minibatch size for GPU throughput
-        "n_epochs": 4,                 # Conservative 4 epochs to prevent policy drift / over-optimization
-        "learning_rate": 5e-6,         # Stabilized learning rate (proven to protect MolGPT grammar)
-        "gamma": 0.99,                 
-        "gae_lambda": 0.95,            
-        "ent_coef": 0.04,              # Increased entropy bonus
-        "clip_range": 0.15,            # Tighter clipping
-        "max_grad_norm": 0.5,          # Tighter gradient clipping
-        "target_kl": 0.03,             # Early-stop threshold
-        "max_length": 50,              
+        "batch_size": 512,
+        "n_epochs": 4,                 # Conservative 4 epochs to prevent policy drift
+        "learning_rate": 5e-6,         # Stabilized LR to protect MolGPT grammar
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "ent_coef": 0.04,              # Entropy bonus for exploration diversity
+        "clip_range": 0.15,            # Tighter clipping for stability
+        "max_grad_norm": 0.5,
+        "target_kl": 0.03,             # Early-stop PPO epochs on KL divergence
+        "max_length": 50,
 
         # ---- Training Duration ----
-        "total_timesteps": 10_000_000, 
+        "total_timesteps": 10_000_000,
 
         # ---- Model Architecture ----
-        "unfreeze_molgpt": True,       
-        "vf_net_arch": [1024, 512, 256],     
+        "unfreeze_molgpt": True,
+        "vf_net_arch": [1024, 512, 256],
 
         # ---- Curriculum Learning ----
         # Phase 1 (warmup): Only QED-based rewards, no docking (runs ~50× faster)
-        # Phase 2 (full):   Full docking enabled once grammar is learned
-        "curriculum_warmup_episodes": 5000,  # Episodes per worker before enabling docking
+        # Phase 2 (full):   Full CPU docking enabled once grammar is learned
+        "curriculum_warmup_episodes": 5000,
 
         # ---- Top-K Experience Replay ----
-        "topk_buffer_size": 100,       # Keep the top-K best molecules for scaffold bonus
-        "topk_similarity_bonus": 1.0,  # Reward bonus for molecules near top-K scaffolds
-        "topk_sim_low": 0.3,           # Minimum Tanimoto sim to earn bonus (avoid random hits)
-        "topk_sim_high": 0.7,          # Maximum Tanimoto sim (penalize exact copies instead)
+        "topk_buffer_size": 100,
+        "topk_similarity_bonus": 1.0,
+        "topk_sim_low": 0.3,
+        "topk_sim_high": 0.7,
 
         # ---- Docking Result Cache ----
-        "docking_cache_size": 10000,   # LRU cache for canonical SMILES → docking scores
+        "docking_cache_size": 10000,   # LRU cache: canonical SMILES → docking score
 
         # ---- Checkpointing & Logging ----
-        "checkpoint_freq": 10_000,     
-        "log_summary_freq": 50,        
-        "checkpoint_dir": os.path.join(project_root, "checkpoints", "hpc_vina_gpu_run"),
-        "log_dir": os.path.join(project_root, "logs", "hpc_vina_gpu_run"),
+        "checkpoint_freq": 10_000,
+        "log_summary_freq": 50,
+        "checkpoint_dir": os.path.join(project_root, "checkpoints", "hpc_cpu_run"),
+        "log_dir": os.path.join(project_root, "logs", "hpc_cpu_run"),
     }
 
 VINA_GPU_CONFIG = get_vina_gpu_config()
@@ -601,28 +604,20 @@ class RewardOracleVinaGPU:
             if babel_res.returncode != 0 or not os.path.exists(temp_pdbqt) or os.path.getsize(temp_pdbqt) == 0:
                 return None
 
-            # Determine if executable is Vina-GPU or standard AutoDock Vina CPU
-            is_gpu = "vina-gpu" in os.path.basename(self.vina_gpu_executable).lower()
-
-            # Write config file (compatible with Vina-GPU 2.1 and standard AutoDock Vina)
+            # Docking is CPU-only (AutoDock Vina). Vina-GPU is disabled until
+            # the CUDA kernel assets are rebuilt from DeltaGroupNJUPT/Vina-GPU-2.1.
+            # Write a standard AutoDock Vina CPU config file.
             with open(config_file, "w") as f:
                 f.write(f"receptor = {self.receptor_path}\n")
-                if is_gpu:
-                    f.write(f"ligand_directory = {ligand_dir}\n")
-                else:
-                    f.write(f"ligand = {temp_pdbqt}\n")
+                f.write(f"ligand = {temp_pdbqt}\n")
                 f.write("center_x = 9.5\n")
                 f.write("center_y = 5.2\n")
                 f.write("center_z = -11.4\n")
                 f.write("size_x = 20.0\n")
                 f.write("size_y = 20.0\n")
                 f.write("size_z = 20.0\n")
-                if is_gpu:
-                    f.write("thread = 8000\n")
-                    f.write(f"search_depth = {self.exhaustiveness}\n")
-                else:
-                    f.write(f"exhaustiveness = {self.exhaustiveness}\n")
-                    f.write("cpu = 1\n")
+                f.write(f"exhaustiveness = {self.exhaustiveness}\n")
+                f.write("cpu = 1\n")  # 1 core per worker prevents Windows thread thrashing
 
             vina_cmd = [
                 self.vina_gpu_executable,
@@ -753,7 +748,7 @@ class MolGenEnvVinaGPU(gym.Env):
 
         self.oracle = RewardOracleVinaGPU(
             receptor_pdbqt_path=receptor_path or VINA_GPU_CONFIG["receptor_path"],
-            vina_gpu_executable=vina_gpu_executable or VINA_GPU_CONFIG["vina_gpu_executable"],
+            vina_gpu_executable=vina_gpu_executable or VINA_GPU_CONFIG["vina_cpu_executable"],
             exhaustiveness=vina_exhaustiveness,
             obabel_path=obabel_path or VINA_GPU_CONFIG["obabel_path"],
             shared_buffer=shared_buffer,
@@ -1128,7 +1123,7 @@ def train(
     batch_size: int = None,
     no_save: bool = False,
     summary_freq: int = None,
-    vina_gpu_executable: str = None,
+    vina_cpu_executable: str = None,   # renamed from vina_gpu_executable; GPU docking disabled
     obabel_path: str = None,
     receptor_path: str = None,
 ):
@@ -1140,7 +1135,7 @@ def train(
     if n_steps is not None: config["n_steps"] = n_steps
     if batch_size is not None: config["batch_size"] = batch_size
     if summary_freq is not None: config["log_summary_freq"] = summary_freq
-    if vina_gpu_executable: config["vina_gpu_executable"] = os.path.abspath(vina_gpu_executable)
+    if vina_cpu_executable: config["vina_cpu_executable"] = os.path.abspath(vina_cpu_executable)
     if obabel_path: config["obabel_path"] = os.path.abspath(obabel_path)
     if receptor_path: config["receptor_path"] = os.path.abspath(receptor_path)
 
@@ -1178,7 +1173,7 @@ def train(
 
     warmup_eps = config.get("curriculum_warmup_episodes", 5000)
     print("=" * 70)
-    print("  HPC PPO MOLECULAR TRAINING - Vina-GPU Edition")
+    print("  HPC PPO MOLECULAR TRAINING - CPU Vina Edition (GPU disabled)")
     print("=" * 70)
     print(f"  Workers         : {config['n_envs']} environments")
     print(f"  Rollout Buffer  : {config['n_steps'] * config['n_envs']:,} transitions")
@@ -1203,7 +1198,7 @@ def train(
             "max_length": config["max_length"],
             "vina_exhaustiveness": config["vina_exhaustiveness"],
             "receptor_path": config["receptor_path"],
-            "vina_gpu_executable": config["vina_gpu_executable"],
+            "vina_gpu_executable": config["vina_cpu_executable"],  # CPU vina.exe
             "obabel_path": config["obabel_path"],
             "shared_buffer": shared_fp_buffer,
             "docking_cache": shared_docking_cache,
@@ -1307,7 +1302,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=None, help="PPO minibatch size")
     parser.add_argument("--no-save", action="store_true", help="Skip saving large checkpoint files (prevents disk thrashing during tests)")
     parser.add_argument("--summary-freq", type=int, default=None, help="Molecule summary frequency")
-    parser.add_argument("--vina-gpu-path", type=str, default=None)
+    parser.add_argument("--vina-path", type=str, default=None, help="Path to vina.exe (CPU docking)")
     parser.add_argument("--obabel-path", type=str, default=None)
     parser.add_argument("--receptor-path", type=str, default=None)
 
@@ -1321,7 +1316,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         no_save=args.no_save,
         summary_freq=args.summary_freq,
-        vina_gpu_executable=args.vina_gpu_path,
+        vina_cpu_executable=args.vina_path,
         obabel_path=args.obabel_path,
         receptor_path=args.receptor_path,
     )
