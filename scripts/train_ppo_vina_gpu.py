@@ -141,7 +141,9 @@ def get_vina_gpu_config() -> dict:
         "clip_range": 0.2,             # Standard PPO clip
         "max_grad_norm": 1.0,          # Relaxed — linear head has no forgetting risk
         "target_kl": None,             # Disable KL early-stop for linear head phase
-        "max_length": 50,
+        # NOTE: Each token can represent multiple SMILES characters (e.g. token 116
+        # = 'c1ccccc1'). 20 fragment-tokens is enough for any drug-like molecule.
+        "max_length": 20,
 
         # ---- Training Duration ----
         "total_timesteps": 10_000_000,
@@ -795,23 +797,31 @@ class MolGenEnvVinaGPU(gym.Env):
         reward = 0.0
         info = {}
 
-        if action == self.eos_token_id or self.step_idx >= self.max_length:
+        # ── Early-termination on valid SMILES ─────────────────────────────
+        # msb-roshan/molgpt uses fragment-level tokenization: each token can
+        # represent multiple SMILES characters (e.g. token 116 = 'c1ccccc1',
+        # token 69 = 'CC', token 120 = 'CCO'). Waiting for EOS or max_length
+        # concatenates fragments into invalid mega-strings.
+        # Solution: decode after every token and terminate as soon as the
+        # current fragment sequence parses as a valid SMILES molecule.
+        token_list = self.seq[:self.step_idx].tolist()
+        raw_smiles = self.tokenizer.decode(token_list, skip_special_tokens=True).strip()
+        cleaned_smiles = raw_smiles.replace(" ", "").split(".")[0]
+        mid_mol = Chem.MolFromSmiles(cleaned_smiles) if len(cleaned_smiles) >= 1 else None
+
+        force_end = (action == self.eos_token_id or self.step_idx >= self.max_length)
+
+        if mid_mol is not None or force_end:
             terminated = True
             self.episode_count += 1
 
-            token_list = self.seq[:self.step_idx].tolist()
-            raw_smiles = self.tokenizer.decode(token_list, skip_special_tokens=True).strip()
-            cleaned_smiles = raw_smiles.replace(" ", "").split(".")[0]
-
-            mol = Chem.MolFromSmiles(cleaned_smiles)
+            mol = mid_mol
             if mol is not None:
                 valid_smiles = Chem.MolToSmiles(mol)
 
                 # ── Curriculum Learning ────────────────────────────────────
-                # Phase 1 (warmup): Skip expensive Vina-GPU docking so the
-                # policy can rapidly learn basic SMILES grammar via QED-only
-                # rewards (~50× faster per episode).
-                # Phase 2 (full): Enable docking once grammar is learned.
+                # Phase 1 (warmup): QED-only rewards for rapid grammar learning.
+                # Phase 2 (full):   CPU docking enabled once grammar is stable.
                 use_docking = self.episode_count > self.curriculum_warmup_episodes
                 if not self._warmup_logged and use_docking:
                     self._warmup_logged = True
@@ -828,15 +838,12 @@ class MolGenEnvVinaGPU(gym.Env):
                 info["docking_score"] = res.get("docking_score", None)
                 info["mw"] = res.get("mw", 0.0)
                 info["curriculum_phase"] = "docking" if use_docking else "warmup"
+                info["episode_length"] = self.step_idx
 
-                # Internal diversity check is managed by RewardOracleVinaGPU
                 info["max_tanimoto"] = res.get("max_tanimoto", 0.0)
                 info["diversity_penalty"] = (res.get("diversity_penalty", 0.0) > 0.0)
 
                 # ── Top-K Scaffold Similarity Bonus ────────────────────────
-                # Give a small reward bonus when the new molecule is
-                # structurally similar (but not identical) to the best known
-                # hits, guiding exploration toward high-affinity neighborhoods.
                 topk_bonus = 0.0
                 try:
                     if self.topk_replay is not None and reward > 0:
@@ -849,7 +856,6 @@ class MolGenEnvVinaGPU(gym.Env):
                             if self._topk_sim_low < max_topk_sim < self._topk_sim_high:
                                 topk_bonus = self._topk_sim_bonus
                                 reward += topk_bonus
-                        # Register this molecule if it's a strong hit
                         if reward > 2.0:
                             fp_bytes = _fp_to_bytes(mol_fp)
                             self.topk_replay.add(float(reward), valid_smiles, fp_bytes)
@@ -858,9 +864,11 @@ class MolGenEnvVinaGPU(gym.Env):
 
                 info["topk_bonus"] = topk_bonus
             else:
+                # EOS or max_length hit without ever forming a valid SMILES
                 reward = -5.0
                 info["smiles"] = cleaned_smiles
                 info["valid"] = False
+                info["episode_length"] = self.step_idx
 
         return self.seq.copy(), float(reward), terminated, False, info
 
