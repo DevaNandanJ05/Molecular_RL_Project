@@ -571,14 +571,41 @@ class PLIPAnalyzer:
         if not os.path.exists(docked_pdbqt_path):
             return empty_result
 
-        # Generate unique temp file names for this call
-        call_id = uuid.uuid4().hex[:8]
+        # Generate unique, PID-safe temp file names for this call
+        call_id = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        temp_mode1_pdbqt = os.path.join(self.temp_dir, f"plip_mode1_{call_id}.pdbqt")
         temp_lig_pdb = os.path.join(self.temp_dir, f"plip_lig_{call_id}.pdb")
         temp_complex_pdb = os.path.join(self.temp_dir, f"plip_cmplx_{call_id}.pdb")
 
         try:
-            # Step 1: Convert docked ligand PDBQT to PDB
-            if not _pdbqt_to_pdb(docked_pdbqt_path, temp_lig_pdb, self.obabel_path):
+            # Step 0: Extract Mode 1 (lowest energy binding pose) from multi-model Vina output
+            with open(docked_pdbqt_path, "r", encoding="utf-8", errors="ignore") as f_in:
+                lines = f_in.readlines()
+
+            mode1_lines = []
+            in_mode1 = False
+            has_models = any(line.startswith("MODEL") for line in lines)
+            if has_models:
+                for line in lines:
+                    if line.startswith("MODEL 1") or (not in_mode1 and line.startswith("MODEL")):
+                        in_mode1 = True
+                    elif line.startswith("ENDMDL"):
+                        if in_mode1:
+                            mode1_lines.append(line)
+                            break
+                    if in_mode1:
+                        mode1_lines.append(line)
+            else:
+                mode1_lines = lines
+
+            if not mode1_lines:
+                return empty_result
+
+            with open(temp_mode1_pdbqt, "w", encoding="utf-8") as f_out:
+                f_out.writelines(mode1_lines)
+
+            # Step 1: Convert isolated Mode 1 ligand PDBQT to PDB
+            if not _pdbqt_to_pdb(temp_mode1_pdbqt, temp_lig_pdb, self.obabel_path):
                 return empty_result
 
             # Step 2: Merge receptor (cached PDB) + ligand into complex
@@ -609,7 +636,7 @@ class PLIPAnalyzer:
 
         finally:
             # Clean up temp files
-            for f in [temp_lig_pdb, temp_complex_pdb]:
+            for f in [temp_mode1_pdbqt, temp_lig_pdb, temp_complex_pdb]:
                 if os.path.exists(f):
                     try:
                         os.remove(f)

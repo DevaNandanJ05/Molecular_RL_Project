@@ -13,6 +13,8 @@ checkpoints/
 temp_ligand*.sdf
 temp_ligand*.pdbqt
 *.log
+logs/
+data/temp/
 
 # OS generated files
 .DS_Store
