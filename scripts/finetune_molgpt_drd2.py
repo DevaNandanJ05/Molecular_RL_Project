@@ -117,34 +117,35 @@ def download_drd2_actives_chembl(
                 activity_nm = float(val)
             except (ValueError, TypeError):
                 continue
+
+            if activity_nm > max_ic50_nm:
+                continue
+
+            # Validate and canonicalize with RDKit
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue
+
+            canon_smi = Chem.MolToSmiles(mol)
+            if canon_smi in seen_smiles:
+                continue
+
+            # Drug-likeness filters
+            mw = Descriptors.MolWt(mol)
+            if mw < min_mw or mw > max_mw:
+                continue
+
+            # Filter out salts and multi-fragment molecules
+            if '.' in canon_smi:
+                continue
+
+            seen_smiles.add(canon_smi)
+            valid_molecules.append(canon_smi)
+            
     except Exception as e:
         print(f"\n[SFT] ChEMBL API crashed during download (Server 500 Error): {e}")
         print("      Falling back to local file if available...")
         return _load_local_smiles(output_path)
-
-        if activity_nm > max_ic50_nm:
-            continue
-
-        # Validate and canonicalize with RDKit
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            continue
-
-        canon_smi = Chem.MolToSmiles(mol)
-        if canon_smi in seen_smiles:
-            continue
-
-        # Drug-likeness filters
-        mw = Descriptors.MolWt(mol)
-        if mw < min_mw or mw > max_mw:
-            continue
-
-        # Filter out salts and multi-fragment molecules
-        if '.' in canon_smi:
-            continue
-
-        seen_smiles.add(canon_smi)
-        valid_molecules.append(canon_smi)
 
     print(f"  Total unique DRD2 actives found: {len(valid_molecules)}")
 
