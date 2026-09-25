@@ -160,40 +160,74 @@ def download_drd2_actives_chembl(
 
 
 def _load_local_smiles(path: str) -> list:
-    """Load SMILES from a local file (one per line)."""
+    """Load SMILES from a local file, or download the TDC DRD2 dataset as a fallback."""
     if not os.path.exists(path):
-        print(f"[WARNING] No local SMILES file found at {path}")
-        print("[WARNING] Since the ChEMBL API is down, generating a fallback dataset of known DRD2 actives...")
+        print(f"\n[WARNING] No local SMILES file found at {path}")
+        print("[WARNING] Since the ChEMBL API is down, automatically switching to the Therapeutics Data Commons (TDC) dataset...")
+        print("          Downloading DRD2 actives from Harvard Dataverse...")
         
-        # A curated list of known, high-affinity DRD2 ligands (antipsychotics, agonists, etc.)
-        fallback_smiles = [
-            "O=C(CCCN1CCC(O)(c2ccc(Cl)cc2)CC1)c1ccc(F)cc1",      # Haloperidol
-            "Cc1nc2n(c(=O)c1CCN1CCC(c3noc4cc(F)ccc34)CC1)CCCC2", # Risperidone
-            "O=C1CCc2ccc(OCCCCN3CCN(c4cccc(Cl)c4Cl)CC3)cc2N1",   # Aripiprazole
-            "CN1CCN(C2=Nc3cc(Cl)ccc3Nc3ccccc32)CC1",             # Clozapine
-            "CN1CCN(C2=Nc3ccccc3Sc3cc(C)cNN32)CC1",              # Olanzapine
-            "O=C(CCCN1CCN(c2cccc(Cl)c2)CC1)c1ccc(F)cc1",         # Droperidol
-            "CN1CCN(c2ccc(C(F)(F)F)cc2)CC1",                     # TFMPP (partial)
-            "Clc1ccc(N2CCN(CCCNC(=O)c3cc4ccccc4[nH]3)CC2)cc1Cl", # Lurasidone fragment
-            "CC1CN(C2CCN(c3nsc4ccccc34)CC2)CCO1",                # Isomer/Fragment
-            "O=C(c1ccc(F)cc1)CCCN1CCC(c2c[nH]c3ccccc23)CC1",     # Fragment
-            "CN(C)CCC=C1c2ccccc2Sc3ccc(Cl)cc31",                 # Chlorprothixene
-            "CN1CCN(CCCN2c3ccccc3Sc3ccc(Cl)cc32)CC1",            # Prochlorperazine
-            "CN1CCN(C2=Nc3ccccc3Oc3ccc(Cl)cc32)CC1",             # Loxapine
-            "CN1CCN(CCCN2c3ccccc3Sc3ccc(C(F)(F)F)cc32)CC1",      # Fluphenazine
-            "CN(C)CCCN1c2ccccc2Sc2ccccc21",                      # Promazine
-            "O=C(CCCN1CCC(c2ccccc2)(c2ccccc2)CC1)c1ccc(F)cc1",   # Fragment
-            "CN1CCN(C2=Nc3cc(C(F)(F)F)ccc3Nc3ccccc32)CC1",       # Flibanserin-like
-            "Cc1onc(c2ccccc2)c1C1CCN(Cc2ccccc2)CC1",             # Fragment
-            "O=C(CCCN1CCC(n2c(=O)[nH]c3ccccc32)CC1)c1ccc(F)cc1", # Benperidol
-            "CN1CCN(C2=Nc3ccccc3Sc3cc(Cl)ccc32)CC1",             # Clotiapine
-        ]
+        import urllib.request
+        import csv
         
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w') as f:
-            for smi in fallback_smiles:
-                f.write(smi + '\n')
-        print(f"[SFT] Wrote {len(fallback_smiles)} fallback SMILES to {path}")
+        # TDC DRD2 Dataset (PairMolGen) hosted on Harvard Dataverse
+        tdc_url = "https://dataverse.harvard.edu/api/access/datafile/4170957"
+        temp_tsv = path + ".tmp.tsv"
+        
+        try:
+            urllib.request.urlretrieve(tdc_url, temp_tsv)
+            print("          Parsing dataset for unique SMILES...")
+            unique_smiles = set()
+            with open(temp_tsv, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f, delimiter='\t')
+                next(reader) # skip header
+                for row in reader:
+                    if len(row) >= 2:
+                        unique_smiles.add(row[0].strip())
+                        unique_smiles.add(row[1].strip())
+            
+            # Write out the curated SMILES
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                for smi in unique_smiles:
+                    if smi:
+                        f.write(smi + '\n')
+                        
+            print(f"[SFT] Successfully extracted {len(unique_smiles)} DRD2 SMILES from TDC dataset.")
+            # Clean up temp file
+            if os.path.exists(temp_tsv):
+                os.remove(temp_tsv)
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to download TDC fallback dataset: {e}")
+            print("        Generating 20-molecule emergency dataset...")
+            # A curated list of known, high-affinity DRD2 ligands
+            fallback_smiles = [
+                "O=C(CCCN1CCC(O)(c2ccc(Cl)cc2)CC1)c1ccc(F)cc1",      # Haloperidol
+                "Cc1nc2n(c(=O)c1CCN1CCC(c3noc4cc(F)ccc34)CC1)CCCC2", # Risperidone
+                "O=C1CCc2ccc(OCCCCN3CCN(c4cccc(Cl)c4Cl)CC3)cc2N1",   # Aripiprazole
+                "CN1CCN(C2=Nc3cc(Cl)ccc3Nc3ccccc32)CC1",             # Clozapine
+                "CN1CCN(C2=Nc3ccccc3Sc3cc(C)cNN32)CC1",              # Olanzapine
+                "O=C(CCCN1CCN(c2cccc(Cl)c2)CC1)c1ccc(F)cc1",         # Droperidol
+                "CN1CCN(c2ccc(C(F)(F)F)cc2)CC1",                     # TFMPP (partial)
+                "Clc1ccc(N2CCN(CCCNC(=O)c3cc4ccccc4[nH]3)CC2)cc1Cl", # Lurasidone fragment
+                "CC1CN(C2CCN(c3nsc4ccccc34)CC2)CCO1",                # Isomer/Fragment
+                "O=C(c1ccc(F)cc1)CCCN1CCC(c2c[nH]c3ccccc23)CC1",     # Fragment
+                "CN(C)CCC=C1c2ccccc2Sc3ccc(Cl)cc31",                 # Chlorprothixene
+                "CN1CCN(CCCN2c3ccccc3Sc3ccc(Cl)cc32)CC1",            # Prochlorperazine
+                "CN1CCN(C2=Nc3ccccc3Oc3ccc(Cl)cc32)CC1",             # Loxapine
+                "CN1CCN(CCCN2c3ccccc3Sc3ccc(C(F)(F)F)cc32)CC1",      # Fluphenazine
+                "CN(C)CCCN1c2ccccc2Sc2ccccc21",                      # Promazine
+                "O=C(CCCN1CCC(c2ccccc2)(c2ccccc2)CC1)c1ccc(F)cc1",   # Fragment
+                "CN1CCN(C2=Nc3cc(C(F)(F)F)ccc3Nc3ccccc32)CC1",       # Flibanserin-like
+                "Cc1onc(c2ccccc2)c1C1CCN(Cc2ccccc2)CC1",             # Fragment
+                "O=C(CCCN1CCC(n2c(=O)[nH]c3ccccc32)CC1)c1ccc(F)cc1", # Benperidol
+                "CN1CCN(C2=Nc3ccccc3Sc3cc(Cl)ccc32)CC1",             # Clotiapine
+            ]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                for smi in fallback_smiles:
+                    f.write(smi + '\n')
+            print(f"[SFT] Wrote {len(fallback_smiles)} emergency fallback SMILES to {path}")
 
     with open(path, 'r') as f:
         smiles = [line.strip() for line in f if line.strip()]
