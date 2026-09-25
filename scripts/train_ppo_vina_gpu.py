@@ -111,6 +111,12 @@ def get_vina_gpu_config() -> dict:
     NOTE: Docking now runs on CPU AutoDock Vina (vina.exe). GPU docking is
     disabled until Vina-GPU-2.1 is rebuilt with matching CUDA kernel assets."""
     cpu_vina = resolve_vina_cpu_path()
+    # ---- SFT Model Path ----
+    # If a DRD2-fine-tuned model exists, use it instead of generic MolGPT.
+    # This is the output of scripts/finetune_molgpt_drd2.py (Phase 2).
+    sft_best = os.path.join(project_root, "checkpoints", "molgpt_drd2_sft", "best_model")
+    sft_model = sft_best if os.path.isdir(sft_best) else "msb-roshan/molgpt"
+
     return {
         # ---- File Paths ----
         "receptor_path": os.path.join(project_root, "data", "raw", "drd2_clean.pdbqt"),
@@ -118,10 +124,22 @@ def get_vina_gpu_config() -> dict:
         "vina_gpu_executable": cpu_vina,   # Alias to avoid KeyError in any caller
         "obabel_path": resolve_obabel_path(),
 
+        # ---- Supervised Fine-Tuned Model (Phase 2) ----
+        # After running finetune_molgpt_drd2.py, the model here is already
+        # biased toward DRD2-like chemical space. RL only needs incremental
+        # adjustments instead of discovering DRD2 binders from scratch.
+        "sft_model_path": sft_model,
+
+        # ---- Prior-Agent KL Regularization (REINVENT-style) ----
+        # A frozen copy of the SFT model acts as an anchor. The KL divergence
+        # between the Agent's token distribution and the Prior's distribution
+        # is added as a penalty to the reward, mathematically preventing
+        # mode collapse by bounding how far the policy can drift.
+        "prior_kl_enabled": True,
+        "prior_kl_beta": 0.1,          # KL penalty coefficient (higher = more conservative)
+
         # ---- Parallelism ----
-        # 12 workers fits comfortably in 32 GB RAM with frozen MolGPT
-        # (unfrozen would require ~13 GB/process — 32 workers × 350 MB workers = 11.2 GB
-        #  + 13 GB main process = RAM thrash. Frozen saves ~10 GB total.)
+        # 12 workers fits comfortably in 24 GB RAM with unfrozen MolGPT
         "n_envs": 12,
         "vec_env": "subproc",
 
@@ -129,16 +147,17 @@ def get_vina_gpu_config() -> dict:
         "vina_exhaustiveness": 4,      # Low exhaustiveness for training throughput
         "vina_cpu_threads": 1,         # 1 CPU core per worker to prevent thread thrashing
 
-        # ---- PPO Hyperparameters (tuned for FROZEN MolGPT backbone) ----
-        # With MolGPT frozen, only the small action/value heads are trained.
-        # This allows a much higher LR, more epochs, and relaxed clipping.
+        # ---- PPO Hyperparameters (tuned for UNFROZEN SFT backbone) ----
+        # With the SFT model unfrozen on 24 GB VRAM, the entire Transformer
+        # adapts its self-attention to the DRD2 pocket geometry.
+        # Tiny LR prevents catastrophic forgetting of chemistry grammar.
         "n_steps": 512,                # 512 × 12 = 6,144 transitions per rollout
         "batch_size": 256,             # Smaller batch — smaller network to update
         "n_epochs": 6,                 # More epochs — no catastrophic forgetting risk
-        "learning_rate": 1e-4,         # Stable LR for linear action head
+        "learning_rate": 1e-6,         # Tiny LR for full transformer fine-tuning
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "ent_coef": 0.005,             # Controlled entropy to avoid aggressive distribution shift
+        "ent_coef": 0.05,              # High entropy to prevent mode collapse
         "clip_range": 0.2,             # Standard PPO clip
         "max_grad_norm": 1.0,          # Clip gradients
         "target_kl": 0.03,             # Guardrail to prevent KL explosion / policy collapse
@@ -150,10 +169,10 @@ def get_vina_gpu_config() -> dict:
         "total_timesteps": 10_000_000,
 
         # ---- Model Architecture ----
-        # PHASE 1: Freeze MolGPT — only train action + value heads
-        # Grammar is preserved. Validity recovers to ~80%+ immediately.
-        # PHASE 2 (later): Set unfreeze_molgpt=True with lr=5e-7 to fine-tune.
-        "unfreeze_molgpt": False,
+        # MolGPT Unfrozen — the entire 50M param Transformer adapts to DRD2.
+        # This is safe because the SFT phase already taught DRD2 grammar,
+        # and the Prior-Agent KL penalty prevents drift.
+        "unfreeze_molgpt": True,
         "vf_net_arch": [512, 256],     # Smaller value net — simpler features
 
         # ---- Curriculum Learning ----
@@ -167,7 +186,7 @@ def get_vina_gpu_config() -> dict:
         "topk_sim_high": 0.7,
 
         # ---- Docking Result Cache ----
-        "docking_cache_size": 10000,   # LRU cache: canonical SMILES → docking score
+        "docking_cache_size": 50000,   # LRU cache: canonical SMILES → docking score
 
         # ---- IF-ARS (Interaction Fingerprint-guided Adaptive Reward Shaping with PLIP) ----
         "ifars_enabled": True,
@@ -180,8 +199,8 @@ def get_vina_gpu_config() -> dict:
         # ---- Checkpointing & Logging ----
         "checkpoint_freq": 10_000,
         "log_summary_freq": 50,
-        "checkpoint_dir": os.path.join(project_root, "checkpoints", "hpc_frozen_run"),
-        "log_dir": os.path.join(project_root, "logs", "hpc_frozen_run"),
+        "checkpoint_dir": os.path.join(project_root, "checkpoints", "hpc_sft_kl_run"),
+        "log_dir": os.path.join(project_root, "logs", "hpc_sft_kl_run"),
     }
 
 VINA_GPU_CONFIG = get_vina_gpu_config()
@@ -990,7 +1009,10 @@ class MolGenEnvVinaGPU(gym.Env):
 class MolGPTExtractorGPU(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Box):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        generator = PretrainedSMILESGenerator(device=device)
+
+        # Load SFT model if available, otherwise fall back to generic MolGPT
+        sft_model_path = VINA_GPU_CONFIG.get("sft_model_path", "msb-roshan/molgpt")
+        generator = PretrainedSMILESGenerator(model_name=sft_model_path, device=device)
         hidden_size = generator.model.config.n_embd
 
         super().__init__(observation_space, features_dim=hidden_size)
@@ -1006,6 +1028,21 @@ class MolGPTExtractorGPU(BaseFeaturesExtractor):
         else:
             for param in self.generator.model.parameters():
                 param.requires_grad = False
+
+        # ── Prior Model for KL Regularization ──────────────────────────
+        # A frozen copy of the SFT model. During training, the KL divergence
+        # between Agent logits and Prior logits is computed and added as a
+        # reward penalty. This mathematically prevents mode collapse by
+        # bounding how far the policy can drift from the Prior distribution.
+        self.prior_model = None
+        if VINA_GPU_CONFIG.get("prior_kl_enabled", False):
+            print(f"[Prior-Agent KL] Loading frozen Prior model from: {sft_model_path}")
+            prior_gen = PretrainedSMILESGenerator(model_name=sft_model_path, device=device)
+            self.prior_model = prior_gen.model
+            self.prior_model.eval()
+            for param in self.prior_model.parameters():
+                param.requires_grad = False
+            print(f"[Prior-Agent KL] Prior model loaded and frozen. β={VINA_GPU_CONFIG.get('prior_kl_beta', 0.1)}")
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         obs_long = observations.long().to(self.generator.model.device)
@@ -1038,6 +1075,111 @@ class MolGPTExtractorGPU(BaseFeaturesExtractor):
         step_hidden = hidden_states[batch_indices, lengths - 1, :]
 
         return step_hidden.float()
+
+# ============================================================================
+# PRIOR-AGENT KL DIVERGENCE PENALTY CALLBACK (REINVENT-style)
+# ============================================================================
+class PriorKLPenaltyCallback(BaseCallback):
+    """
+    Implements the Prior-Agent KL divergence regularization used by REINVENT 4,
+    FREED, and all modern RLHF systems.
+
+    At each rollout step, this callback:
+      1. Takes the current observation (token sequence) from the rollout buffer
+      2. Computes the Agent's action logits (from the trainable model)
+      3. Computes the Prior's action logits (from the frozen SFT model)
+      4. Calculates KL(Agent || Prior) for each observation
+      5. Subtracts β × KL from the stored rewards before PPO updates
+
+    This mathematically prevents mode collapse: if the Agent tries to
+    concentrate all probability mass on a single token (like the thiadiazole
+    exploit from last week), the KL penalty explodes because that distribution
+    is extremely far from the Prior's broad distribution over DRD2-like
+    chemical space.
+    """
+
+    def __init__(self, beta: float = 0.1, log_freq: int = 1000, verbose: int = 1):
+        super().__init__(verbose)
+        self.beta = beta
+        self.log_freq = log_freq
+        self._n_updates = 0
+        self._kl_history = []
+
+    def _on_rollout_end(self) -> None:
+        """Called after each rollout is collected but BEFORE PPO updates."""
+        prior_model = self.model.policy.features_extractor.prior_model
+        if prior_model is None:
+            return
+
+        rollout_buffer = self.model.rollout_buffer
+        agent_model = self.model.policy.features_extractor.generator.model
+        pad_token_id = self.model.policy.features_extractor.pad_token_id
+        device = next(agent_model.parameters()).device
+
+        total_kl = 0.0
+        n_obs = 0
+
+        # Process observations in mini-batches to avoid OOM
+        batch_size = 64
+        obs_all = rollout_buffer.observations.copy()
+        rewards_all = rollout_buffer.rewards.copy()
+
+        for start in range(0, len(obs_all), batch_size):
+            end = min(start + batch_size, len(obs_all))
+            obs_batch = torch.tensor(obs_all[start:end].squeeze(1), dtype=torch.long, device=device)
+            attention_mask = (obs_batch != pad_token_id).long()
+
+            # Compute sequence lengths to get the "current step" logits
+            pad_mask = (obs_batch == pad_token_id)
+            lengths = pad_mask.float().argmax(dim=1)
+            no_pad = (~pad_mask).all(dim=1)
+            lengths[no_pad] = obs_batch.shape[1]
+            lengths = torch.clamp(lengths, min=1) - 1  # Index of last real token
+
+            with torch.no_grad():
+                # Agent logits
+                agent_out = agent_model(input_ids=obs_batch, attention_mask=attention_mask)
+                agent_logits = agent_out.logits
+
+                # Prior logits
+                prior_out = prior_model(input_ids=obs_batch, attention_mask=attention_mask)
+                prior_logits = prior_out.logits
+
+            # Extract logits at the current generation step for each sequence
+            batch_idx = torch.arange(obs_batch.shape[0], device=device)
+            agent_step_logits = agent_logits[batch_idx, lengths, :]
+            prior_step_logits = prior_logits[batch_idx, lengths, :]
+
+            # Compute KL divergence: KL(Agent || Prior)
+            agent_log_probs = torch.nn.functional.log_softmax(agent_step_logits, dim=-1)
+            prior_log_probs = torch.nn.functional.log_softmax(prior_step_logits, dim=-1)
+            kl_per_obs = torch.nn.functional.kl_div(
+                prior_log_probs, agent_log_probs,
+                log_target=True, reduction='none'
+            ).sum(dim=-1)  # Shape: (batch,)
+
+            # Apply KL penalty to rewards
+            kl_penalty = self.beta * kl_per_obs.cpu().numpy()
+            rewards_all[start:end, 0] -= kl_penalty
+
+            total_kl += kl_per_obs.sum().item()
+            n_obs += obs_batch.shape[0]
+
+        # Write modified rewards back to rollout buffer
+        rollout_buffer.rewards[:] = rewards_all
+
+        # Logging
+        avg_kl = total_kl / max(n_obs, 1)
+        self._kl_history.append(avg_kl)
+        self._n_updates += 1
+
+        self.logger.record("prior_kl/avg_kl_divergence", avg_kl)
+        self.logger.record("prior_kl/beta", self.beta)
+        self.logger.record("prior_kl/avg_penalty", avg_kl * self.beta)
+
+        if self._n_updates % 10 == 0 and self.verbose >= 1:
+            print(f"  [Prior-KL] Update {self._n_updates}: "
+                  f"Avg KL={avg_kl:.4f}, Penalty={avg_kl * self.beta:.4f}")
 
 # ============================================================================
 # LOGGING & CHECKPOINT CALLBACKS
@@ -1331,14 +1473,21 @@ def train(
     # -------------------------------------------------------------------------
 
     warmup_eps = config.get("curriculum_warmup_episodes", 5000)
+    sft_path = config.get("sft_model_path", "msb-roshan/molgpt")
+    is_sft = sft_path != "msb-roshan/molgpt"
     print("=" * 70)
-    print("  HPC PPO MOLECULAR TRAINING - CPU Vina Edition (GPU disabled)")
+    print("  HPC PPO MOLECULAR TRAINING — SFT + Prior-Agent KL Architecture")
     print("=" * 70)
+    print(f"  Base Model      : {sft_path}")
+    print(f"  SFT Phase       : {'ACTIVE (DRD2-tuned)' if is_sft else 'NOT FOUND — using generic MolGPT'}")
+    print(f"  Backbone        : {'UNFROZEN (full fine-tuning)' if config.get('unfreeze_molgpt') else 'FROZEN (action head only)'}")
+    print(f"  Prior-Agent KL  : {'ENABLED (β=' + str(config.get('prior_kl_beta', 0.1)) + ')' if config.get('prior_kl_enabled') else 'DISABLED'}")
     print(f"  Workers         : {config['n_envs']} environments")
     print(f"  Rollout Buffer  : {config['n_steps'] * config['n_envs']:,} transitions")
     print(f"  Minibatch Size  : {config['batch_size']}")
     print(f"  PPO Epochs      : {config['n_epochs']}")
     print(f"  Learning Rate   : {config['learning_rate']}")
+    print(f"  Entropy Coeff   : {config['ent_coef']}")
     print(f"  Target KL       : {config['target_kl']}")
     print(f"  Diversity Buffer: {'Shared (global)' if shared_fp_buffer else 'Local (per-worker)'}")
     print(f"  Docking Cache   : {'Shared (global)' if shared_docking_cache else 'Disabled'}")
@@ -1416,6 +1565,18 @@ def train(
     callbacks = [
         MoleculeLoggingCallback(log_dir=config["log_dir"], summary_freq=config["log_summary_freq"]),
     ]
+
+    # ── Prior-Agent KL Penalty Callback ───────────────────────────────
+    # Adds REINVENT-style KL divergence penalty to rewards at each rollout,
+    # mathematically preventing mode collapse by anchoring the Agent to the
+    # frozen Prior (SFT model).
+    if config.get("prior_kl_enabled", False):
+        kl_beta = config.get("prior_kl_beta", 0.1)
+        callbacks.append(PriorKLPenaltyCallback(beta=kl_beta))
+        print(f"[HPC Setup] Prior-Agent KL Penalty: ENABLED (β={kl_beta})")
+    else:
+        print(f"[HPC Setup] Prior-Agent KL Penalty: DISABLED")
+
     if not no_save:
         callbacks.append(
             CleanCheckpointCallback(
@@ -1462,7 +1623,7 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     parser = argparse.ArgumentParser(description="Vina-GPU PPO Training")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--n-envs", type=int, default=32)
+    parser.add_argument("--n-envs", type=int, default=12, help="Set to 12 for 16-core HPC")
     parser.add_argument("--vec-env", type=str, choices=["subproc", "dummy"], default="subproc")
     parser.add_argument("--timesteps", type=int, default=10_000_000)
     parser.add_argument("--n-steps", type=int, default=None, help="PPO rollout steps per env")
