@@ -105,17 +105,22 @@ def download_drd2_actives_chembl(
     seen_smiles = set()
     valid_molecules = []
 
-    for record in results:
-        smi = record.get('canonical_smiles')
-        val = record.get('standard_value')
+    try:
+        for record in results:
+            smi = record.get('canonical_smiles')
+            val = record.get('standard_value')
 
-        if not smi or not val:
-            continue
+            if not smi or not val:
+                continue
 
-        try:
-            activity_nm = float(val)
-        except (ValueError, TypeError):
-            continue
+            try:
+                activity_nm = float(val)
+            except (ValueError, TypeError):
+                continue
+    except Exception as e:
+        print(f"\n[SFT] ChEMBL API crashed during download (Server 500 Error): {e}")
+        print("      Falling back to local file if available...")
+        return _load_local_smiles(output_path)
 
         if activity_nm > max_ic50_nm:
             continue
