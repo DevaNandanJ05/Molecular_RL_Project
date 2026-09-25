@@ -174,7 +174,9 @@ def _load_local_smiles(path: str) -> list:
         temp_tsv = path + ".tmp.tsv"
         
         try:
-            urllib.request.urlretrieve(tdc_url, temp_tsv)
+            req = urllib.request.Request(tdc_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response, open(temp_tsv, 'wb') as out_file:
+                out_file.write(response.read())
             print("          Parsing dataset for unique SMILES...")
             unique_smiles = set()
             with open(temp_tsv, 'r', encoding='utf-8') as f:
