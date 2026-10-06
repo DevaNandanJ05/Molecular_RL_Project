@@ -1,0 +1,27 @@
+{
+  "additional_special_tokens": [
+    "<bos>",
+    "<eos>"
+  ],
+  "bos_token": {
+    "content": "<bos>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  },
+  "eos_token": {
+    "content": "<eos>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  },
+  "pad_token": {
+    "content": "<eos>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  }
+}

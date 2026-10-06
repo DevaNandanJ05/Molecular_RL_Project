@@ -1,20 +1,29 @@
-# Python
+# Python & Environments
 __pycache__/
 *.pyc
 venv/
 env/
+.venv/
 
-# Model Checkpoints (Too large for GitHub)
-checkpoints/
-*.pth
-*.pt
+# Model Checkpoints (Ignore massive raw zips and RL checkpoints)
+checkpoints/*
+!checkpoints/molgpt_drd2_sft/
+checkpoints/molgpt_drd2_sft/*
+!checkpoints/molgpt_drd2_sft/best_model/
+!checkpoints/molgpt_drd2_sft/final_model/
+!checkpoints/molgpt_drd2_sft/training_log.json
+checkpoints/*.pth
+checkpoints/*.pt
+checkpoints/*.zip
 
-# Temporary Docking Files
+# Temporary Docking Files & Scratch Data
 temp_ligand*.sdf
 temp_ligand*.pdbqt
 *.log
 logs/
 data/temp/
+linux_hpc_env/data/temp/
 
 # OS generated files
 .DS_Store
+Thumbs.db
