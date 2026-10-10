@@ -1,0 +1,10 @@
+rank,smiles,qed,mw,logp,hbd,hba,tpsa,rot_bonds,rings,ro5_violations,lipinski_pass,sas,pains_pass,max_tanimoto_active,mean_tanimoto_active,is_novel,docking_score,has_asp114,ifars_overlap,critical_overlap,iteration
+1,O=C(NCc1ccccc1)c1ccccc1C(=O)OCc1ccccc1Cl,0.635,379.8,4.63,1,3,55.4,6,3,0,True,1.73,True,0.533,0.148,True,-9.76,True,0.389,0.375,22
+2,O=CNCC1CCN(CC2COc3ccccc3O2)CC1,0.83,290.4,1.28,1,4,50.8,5,3,0,True,2.89,True,0.654,0.143,True,-9.18,True,0.278,0.375,21
+3,NC(=O)C1CCN(C(=O)Nc2ccccc2)CC1,0.829,247.3,1.42,2,2,75.4,2,2,0,True,1.67,True,0.591,0.174,True,-8.85,True,0.278,0.375,12
+4,O=C(NCc1ccccc1)c1ccc([N+](=O)[O-])cc1O,0.659,272.3,2.23,2,4,92.5,4,2,0,True,1.72,True,0.5,0.142,True,-8.84,True,0.278,0.375,1
+5,O=CNc1ccccc1C(=O)NCc1ccccn1,0.797,255.3,1.58,2,3,71.1,5,2,0,True,1.96,True,0.5,0.136,True,-8.81,True,0.222,0.25,13
+6,CCC(CC)c1ncc(-c2ccc(Oc3cc(OC)ccc3CCNC=O)c([N+](=O)[O-])c2)[nH]1,0.173,452.5,4.98,2,6,119.4,12,3,0,True,2.87,True,0.3,0.101,True,-8.72,True,0.444,0.75,12
+7,O=CNC1CCCCCCC1CS(=O)Oc1ccc(F)cc1,0.817,327.4,2.95,1,3,55.4,6,2,0,True,3.75,True,0.351,0.115,True,-8.65,True,0.389,0.625,20
+8,Nc1ccccc1C(=O)NOCc1ccccn1,0.63,243.3,1.53,2,4,77.2,4,2,0,True,2.09,True,0.418,0.142,True,-8.26,True,0.167,0.125,1
+9,NC(=O)C1(O)Cc2ccccc2C1,0.634,177.2,0.0,2,2,63.3,1,2,0,True,2.51,True,0.354,0.135,True,-8.24,True,0.222,0.375,3

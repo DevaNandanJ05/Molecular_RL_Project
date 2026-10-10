@@ -1,0 +1,7 @@
+Rank,Drug_Key,Drug_Label,Best_dG_kcal_mol,Time_seconds
+1,Molecule_1_AI,Molecule 1 (AI-Generated),-9.53,69
+2,Risperidone,Risperidone,-9.457,74
+3,Clozapine,Clozapine,-9.203,8
+4,Aripiprazole,Aripiprazole,-9.156,104
+5,Olanzapine,Olanzapine,-8.5,8
+6,Haloperidol,Haloperidol (Reference),-8.231,63
