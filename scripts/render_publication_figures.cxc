@@ -1,0 +1,18 @@
+open "c:/Users/devan/OneDrive/Desktop/final project/gromacs_colab_ready/protein.pdb"
+open "c:/Users/devan/OneDrive/Desktop/final project/gromacs_colab_ready/ligand.pdb"
+set bgColor white
+graphics silhouettes true width 1.5 color black
+lighting soft
+color #1 #3366CC
+color #2 byhetero
+style #2 stick
+show :114 atoms
+style :114 stick
+color :114 byhetero
+label :114 text "ASP114" height 1.2 color black offset 0,1,0
+hbonds #2 restrict #1 color green radius 0.08
+view
+save "c:/Users/devan/OneDrive/Desktop/final project/docs/drd2_mol1_side_300dpi.png" width 2400 height 1600 supersample 3
+view :114 | #2
+save "c:/Users/devan/OneDrive/Desktop/final project/docs/drd2_mol1_pocket_300dpi.png" width 2400 height 1600 supersample 3
+exit
